@@ -297,8 +297,10 @@ def rehearse(settings: Settings, sql: str, connection: str | None = None,
     """`progress(done, total, message)` is called after each rung (the MCP server turns it into notifications)."""
     try:
         return _rehearse(settings, sql, connection, fractions, sample, method, seed, progress)
-    except (EngineError, ConfigError) as exc:
+    except ConfigError as exc:
         return _error(str(exc))
+    except EngineError as exc:
+        return _error(_scrubbed(settings, connection, sql, exc))
 
 
 def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: list[float] | None,
@@ -372,7 +374,8 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
                     rung_est = engine.estimate(sampled_sql)
                     rung_cost = rung_est.cost_usd
                 except EngineError as exc:
-                    stopped = f"the engine rejected the sampled query at {fraction:.0%}: {exc}"
+                    stopped = (f"the engine rejected the sampled query at {fraction:.0%}: "
+                               f"{guard.scrub_error(settings, conn, sql, dialect, str(exc))}")
                     break
             if rung_cost is None and len(rungs) >= 2:
                 fit = fit_power_law("runtime_s", [r["fraction"] for r in rungs],
@@ -394,7 +397,7 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
                                      timeout_s=min(budget.max_runtime_s, REHEARSAL_RUNG_TIMEOUT_S),
                                      max_bytes_billed=cap)
             except EngineError as exc:
-                stopped = f"the {fraction:.0%} rung failed: {exc}"
+                stopped = f"the {fraction:.0%} rung failed: {guard.scrub_error(settings, conn, sql, dialect, str(exc))}"
                 break
             cost = res.cost_usd if res.cost_usd is not None else engine.cost_for(res.bytes_processed, res.elapsed_s)
             spent += cost or 0.0
@@ -526,8 +529,19 @@ def run(settings: Settings, sql: str, connection: str | None = None, max_rows: i
         allow_write: bool = False) -> dict[str, Any]:
     try:
         return _run(settings, sql, connection, max_rows, allow_write)
-    except (EngineError, ConfigError) as exc:
+    except ConfigError as exc:
         return _error(str(exc))
+    except EngineError as exc:
+        return _error(_scrubbed(settings, connection, sql, exc))
+
+
+def _scrubbed(settings: Settings, connection: str | None, sql: str, exc: Exception) -> str:
+    """An engine error with data values removed (see guard.scrub_error)."""
+    try:
+        conn = settings.connection(connection)
+    except ConfigError:
+        return str(exc)
+    return guard.scrub_error(settings, conn, sql, dialect_for(conn.engine), str(exc))
 
 
 def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | None,
@@ -606,8 +620,9 @@ def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | N
             res = engine.execute(sql.strip().rstrip(";") if write else pre["sql"].rstrip(";"),
                                  preview_rows=preview_rows, timeout_s=budget.max_runtime_s, max_bytes_billed=cap)
         except EngineError as exc:
+            # engines quote the value that failed: scrub it like a preview before the agent or the receipt sees it
             return finish("error", "The run failed (nothing was returned). Read the error, fix the SQL, preflight again.",
-                          error=str(exc))
+                          error=guard.scrub_error(settings, conn, sql, dialect_for(conn.engine), str(exc)))
         cost = res.cost_usd if res.cost_usd is not None else engine.cost_for(res.bytes_processed, res.elapsed_s)
     store.record_spend({"kind": "run", "connection": conn.name, "engine": conn.engine, "sql_hash": pre["sql_hash"],
                         "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4),
@@ -629,7 +644,8 @@ def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | N
     result = finish("warn" if guarded.get("data_warnings") else "ok",
                     guard.run_next_step(guarded, "Done. Show the human the receipt (gulliver_receipt) if they want "
                                                  "proof."),
-                    actual=actual, truncated=res.truncated or len(guarded["preview"]) < len(res.preview), **guarded)
+                    actual=actual, truncated=(res.truncated or len(guarded["preview"]) < len(res.preview)
+                                              or bool(guarded.get("truncated_by"))), **guarded)
     if comparison:
         result["predicted_vs_actual"] = comparison
         store.save_receipt(result)

@@ -16,11 +16,11 @@ Postgres, BigQuery and Snowflake, because it runs in Gulliver after the engine r
 | Part | How |
 |---|---|
 | Sensitive columns by name | `email`, `phone_number`, `iban`, `bsn`, `ssn`, `passport`, `card_number`, `date_of_birth`, `street_address`, `postcode`, `ip_address`, `last_name`, `password`, `api_key`, `access_token`, `client_secret` and more (Dutch names too). Names like `token_count`, `email_verified` or `ip_country` are not flagged. |
-| Through your SQL | Output-column lineage (sqlglot): `select upper(e) as shout from (select email as e from users)` is still `users.email`. `SELECT *` is expanded with the table metadata. `COUNT(email)`, `email IS NULL` and `LENGTH(token)` do not count: the value itself does not reach the output. |
+| Through your SQL | Output-column lineage (sqlglot): `select upper(e) as shout from (select email as e from users)` is still `users.email`. `SELECT *` is expanded with the table metadata. A whole row as one value (`select c from customers c`, `to_json(c)`, `row(c.*)`, `struct_pack(*)`, `unnest(c)`, DuckDB `COLUMNS(...)`) carries every column of that table. Quoted identifiers (`"Notes"`) match the same policy keys as unquoted ones. `COUNT(email)`, `email IS NULL` and `LENGTH(token)` do not count: the value itself does not reach the output. `SUM`, `AVG`, `MIN` and `MAX` do count: over a one-row group they return the value itself. |
 | Sensitive values | Text cells are checked with validated patterns: email, E.164 phone (`+31 6 ...`), IBAN with the mod-97 check, card numbers with the Luhn check, BSN with the 11-check, IPv4/IPv6, JWTs and API-key shapes (`sk-...`, `ghp_...`, `AKIA...`, `xox?-...`, `AIza...`, Stripe, GitLab, PEM private keys). A column is tagged when at least 60% of its text cells match one category. Tags are remembered in `.gulliver/sensitive/<connection>.json`, so the next preflight knows that `contact` holds emails. |
 | Secrets inside text | An API key or JWT pasted into a free-text cell is masked in place (`my key is [masked:api_key] oops`). |
-| Untrusted envelope | Every run result has `untrusted: true` and a `data_notice`. Text that reads like instructions to an AI is listed in `injection` and `data_warnings` (or replaced, with `injection = "redact"`). Signals: "ignore previous instructions", "you are now", "system prompt", messages addressed to the AI or "Claude", `gulliver_*` tool names, "use the ... MCP", chat role tags, markdown image links to a URL (a known exfiltration trick), invisible Unicode tag and bidi characters, and the same phrases hidden in base64. |
-| Output size | Text cells longer than `max_cell_chars` (default 1,000) are cut. When the preview is over `max_output_chars` (default 50,000 characters of JSON), rows are cut and `column_summary` (nulls, min, max per column) describes all preview rows instead. |
+| Untrusted envelope | Every run result has `untrusted: true` and a `data_notice`. Text that reads like instructions to an AI is listed in `injection` and `data_warnings` (or replaced, with `injection = "redact"`). Signals: "ignore previous instructions", "you are now", "system prompt", messages addressed to the AI or "Claude", `gulliver_*` tool names, "use the ... MCP", chat role tags, markdown image links to a URL (a known exfiltration trick), invisible Unicode tag and bidi characters, zero-width characters inside a word (they are also removed before the phrases are matched, so `Ig\u200bnore` still matches), and the same phrases hidden in base64. Result column names are scanned too (a hostile column name is listed in `injection` with `"in": "column name"`, and renamed under `redact`). |
+| Output size | Text cells longer than `max_cell_chars` (default 1,000) are cut. When the preview is over `max_output_chars` (default 50,000 characters of JSON), rows are cut and `column_summary` (nulls, min, max per column) describes all preview rows instead. When the first row alone is too wide, its cells are shortened to an equal share of the budget. |
 | Lint rule GV014 | `sensitive-column-in-output`: `info` for personal data or a masked secret, `warn` for a secret that would reach the output unmasked. It only fires when the name, the lineage or earlier value tags say the column is sensitive. |
 | Policy per connection | `allow`, `warn`, `mask`, `hash`, `last4` or `deny`, by kind, by category or by column. `deny` blocks at preflight (also through `SELECT *` and aliases); rehearse and run refuse it too. |
 
@@ -64,7 +64,10 @@ max_cell_chars = 1000      # 0 = no limit   (env GULLIVER_MAX_CELL_CHARS)
 `GULLIVER_HASH_SALT`. Without it, Gulliver creates a random salt once in `.gulliver/hash_salt`. The same value
 always gives the same hash, so an agent can still count, group and compare values across runs without seeing
 them. `last4` keeps the last four characters (`****1111`). `mask` shows `[masked:<category>]`. When several rules
-match a column, a `columns` entry wins first, then `categories`, then `pii` or `secrets`.
+match a column, a `columns` entry wins first, then `categories`, then `pii` or `secrets`. An output built from
+several source columns (`country || ssn`, a `UNION`, a whole row) gets the strictest action of its sources
+(`deny` > `mask` > `hash` > `last4` > `warn` > `allow`), so an `allow` on one source never loosens another. An
+output alias that happens to be a policy key can make the action stricter, never looser.
 
 ### Commands
 
@@ -117,12 +120,16 @@ With `categories = { ssn = "deny" }`, `gulliver preflight "select * from custome
 ### Guarantees
 
 - The receipt on disk stores the same guarded preview the agent gets. A masked value is never written unmasked.
+- Engine error messages are scrubbed before the agent or the receipt sees them: values that look like personal
+  data or secrets are masked, and when the query reads a masked or denied column anywhere (also in `WHERE` or
+  `HAVING`), every quoted text in the error that is not in the SQL itself is replaced by `[removed by gulliver]`.
+  A failing `cast(string_agg(ssn, ',') as int)` cannot dump the column.
 - The agent cannot change the policy. It lives in `gulliver.toml`, which the human controls, like the budget.
 - Value scans in `inspect --scan` go through the budget gate like every query Gulliver writes itself. Only tags
   come back, never values.
 - A column marked `deny` cannot reach the output through `SELECT *`, an alias, a CTE or a subquery, as long as
   sqlglot can trace the lineage. When it cannot, the run-time check still removes a `deny` column by its result
-  name or detected values.
+  name (a `table.column` key also matches a result column of that name) or detected values.
 
 ### Limits (read these)
 
@@ -139,7 +146,8 @@ With `categories = { ssn = "deny" }`, `gulliver preflight "select * from custome
   query can still learn things about it (for example `where ssn = '...'`).
 - Only `gulliver_run` previews are guarded. `gulliver_diff` sample keys, `gulliver_check` results and the SQL
   text in receipts are not.
-- Detected tags are cached by `table.column` and are not removed automatically. Delete
+- Detected tags are cached by `table.column` and are not removed automatically. A tag is only saved for an
+  output that is the source column itself (`select contact` or `contact as c`), never for an expression of it. Delete
   `.gulliver/sensitive/<connection>.json` to reset them.
 - Without `GULLIVER_HASH_SALT`, the salt file in `.gulliver/` can be read by anyone who can read that folder.
   Hashes of low-entropy values (phone numbers, BSNs) can be brute-forced by someone who has the salt.
