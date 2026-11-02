@@ -7,6 +7,8 @@ import os
 
 import duckdb
 import pytest
+import sqlglot
+from sqlglot import exp
 
 from gulliver import core, features, security
 from gulliver.cli import main
@@ -249,3 +251,99 @@ def test_inspect_does_not_reveal_files_outside_allowed_paths(settings):
     out = core.inspect(settings, table="read_csv('/etc/passwd')")
     assert out["status"] == "ok"
     assert "bytes" not in out["table"] and "GS004" in out["table"]["notes"][0]
+
+
+# -- review fixes ------------------------------------------------------------------------------------
+def _folder_policy(folder):
+    return security.SecurityPolicy(allowed_paths=(str(folder),), allow_remote=False, base_dir=str(folder))
+
+
+def test_globs_that_match_hidden_files_are_refused(tmp_path):
+    (tmp_path / ".env").write_text("SECRET_KEY=hunter2\n")
+    (tmp_path / "home" / ".aws").mkdir(parents=True)
+    (tmp_path / "home" / ".aws" / "credentials").write_text("[default]\n")
+    _write_files(tmp_path / "data")
+    policy = _folder_policy(tmp_path)
+    for path in ("[.]env", "?env", "*env", "**/*env", f"{tmp_path}/[.]env", "**/credentials", "home/*/credentials",
+                 "home/[.]aws/credentials", "*"):
+        st = classify(f"select * from read_csv('{path}', header = false)", "duckdb", policy)
+        assert st.kind == "block" and st.code == "GS004", path
+    for path in ("data/*.csv", "data/**/*.parquet", "*/x.csv", "nothing-*.csv"):  # globs over data files still work
+        assert classify(f"select * from read_csv('{path}')", "duckdb", policy).kind == "read", path
+
+
+def test_engine_run_refuses_glob_over_hidden_file(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("SECRET_KEY=hunter2\n")
+    monkeypatch.chdir(tmp_path)
+    settings = load_settings(dsn=":memory:")
+    for path in ("[.]env", "*env"):
+        out = core.run(settings, f"select * from read_csv('{path}', header = false)")
+        assert out["status"] == "block" and "hunter2" not in json.dumps(out), path
+
+
+def test_glob_with_dotdot_cannot_leave_the_allowed_folder(tmp_path):
+    work, outside = tmp_path / "work", tmp_path / "outside"
+    (work / "sub").mkdir(parents=True)
+    outside.mkdir()
+    (outside / "secret.csv").write_text("a\n1\n")
+    st = classify("select * from read_csv('su?/../../outside/secr*')", "duckdb", _folder_policy(work))
+    assert st.kind == "block" and st.code == "GS004"
+    # the engine's size estimate must not reveal that the outside file exists either
+    engine = DuckDBEngine(Connection("w", "duckdb", {"path": ":memory:", "allowed_paths": [str(work)]}))
+    try:
+        node = sqlglot.parse_one("select * from read_csv('su?/../../outside/secr*')", read="duckdb").find(exp.Table)
+        old = os.getcwd()
+        os.chdir(work)
+        try:
+            info = engine._file_info(node, "x")
+        finally:
+            os.chdir(old)
+        assert info.bytes is None and "GS004" in info.notes[0]
+    finally:
+        engine.close()
+
+
+def test_glob_matching_a_symlink_out_is_refused(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (tmp_path / "secret.csv").write_text("a\n1\n")
+    (work / "data.csv").symlink_to(tmp_path / "secret.csv")
+    assert classify("select * from read_csv('*.csv')", "duckdb", _folder_policy(work)).code == "GS004"
+
+
+def test_default_roots_skip_root_and_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "proj").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    mem = Connection("m", "duckdb", {"path": ":memory:"})
+    assert security.allowed_roots(mem, cwd="/") == []
+    assert security.allowed_roots(mem, cwd=str(home)) == []
+    assert security.allowed_roots(mem, cwd=str(tmp_path)) == []  # above the home folder
+    assert security.allowed_roots(mem, cwd=str(home / "proj")) == [str(home / "proj")]
+    db = Connection("d", "duckdb", {"path": str(home / "proj" / "x.duckdb")})
+    assert security.allowed_roots(db, cwd="/") == [str(home / "proj")]
+    policy = security.policy_for(db, cwd="/")
+    assert classify("select * from read_csv('/etc/passwd')", "duckdb", policy).code == "GS004"
+    # a human may still write a broad folder, but the selftest then fails instead of skipping
+    assert security.allowed_roots(Connection("w", "duckdb", {"path": ":memory:", "allowed_paths": ["/"]})) == ["/"]
+
+
+def test_selftest_fails_on_a_too_broad_folder(state, tmp_path):
+    (tmp_path / "gulliver.toml").write_text("[connections.wide]\nengine = 'duckdb'\npath = ':memory:'\n"
+                                            "allowed_paths = ['/']\n", encoding="utf-8")
+    out = security.selftest(load_settings(), "wide")
+    assert out["status"] == "fail"
+    assert "allowed folders are narrow" in {c["check"] for c in out["sandbox"]["checks"] if c["status"] == "fail"}
+
+
+def test_every_duckdb_file_reader_is_checked():
+    """A table function that takes a file path must be path-checked (FILE_FUNCTIONS) or refused by name."""
+    con = duckdb.connect()
+    rows = con.execute("SELECT DISTINCT function_name, parameters FROM duckdb_functions() "
+                       "WHERE function_type = 'table'").fetchall()
+    con.close()
+    not_files = {"json_each", "json_tree"}  # 'path' is a JSON path there
+    readers = {name for name, params in rows if name not in not_files
+               and ({"path", "paths", "file", "files"} & set(params or []) or name.startswith("read_"))}
+    missing = sorted(n for n in readers if n not in security.FILE_FUNCTIONS and n not in security._FUNCTIONS)
+    assert missing == []

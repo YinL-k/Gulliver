@@ -905,3 +905,133 @@ dialect = "postgres"
 sql = "select t.nextval from t"
 expect = "read"
 note = "only Snowflake's seq.NEXTVAL advances a sequence"
+
+# -- review fixes: glob tricks, new DuckDB readers, dynamic SQL and writes in disguise ------------
+[[case]]
+id = "gs004-glob-bracket-dot"
+dialect = "duckdb"
+sql = "select * from read_csv('[.]env', header = false)"
+expect = "block"
+code = "GS004"
+note = "a glob in place of the dot still matches .env; '*env' and '**/credentials' are checked against the files"
+
+[[case]]
+id = "gs004-glob-question-dot"
+dialect = "duckdb"
+sql = "select * from read_csv('?env', header = false)"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-glob-bracket-dot-folder"
+dialect = "duckdb"
+sql = "select * from read_csv('[.]gulliver/ledger.jsonl')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-glob-bracket-dot-absolute"
+dialect = "duckdb"
+sql = "select * from read_csv('/gulliver-selftest/data/[.]aws/credentials', header = false)"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-glob-then-dotdot"
+dialect = "duckdb"
+sql = "select * from read_csv('su?/../../outside/secr*')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-read-duckdb"
+dialect = "duckdb"
+sql = "select * from read_duckdb('/etc/other.duckdb')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-read-single-csv-file"
+dialect = "duckdb"
+sql = "select * from read_single_csv_file('.env', header := false)"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-read-single-json-file"
+dialect = "duckdb"
+sql = "select * from read_single_json_file('/etc/x.json')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-read-single-parquet-file"
+dialect = "duckdb"
+sql = "select * from read_single_parquet_file('../x.parquet')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-parquet-full-metadata"
+dialect = "duckdb"
+sql = "select * from parquet_full_metadata('/etc/x.parquet')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs003-postgres-ts-rewrite"
+dialect = "postgres"
+sql = "select ts_rewrite('a'::tsquery, 'select ''a''::tsquery, ''b''::tsquery from pg_stat_activity where pg_terminate_backend(pid)')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs002-postgres-brin-summarize"
+dialect = "postgres"
+sql = "select brin_summarize_new_values('users_brin')"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-postgres-gin-clean-pending-list"
+dialect = "postgres"
+sql = "select gin_clean_pending_list('users_gin'::regclass)"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs001-postgres-log-standby-snapshot"
+dialect = "postgres"
+sql = "select pg_log_standby_snapshot()"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "block-merge-in-cte"
+dialect = "postgres"
+sql = "with m as (merge into t using s on t.id = s.id when matched then delete returning t.*) select * from m"
+expect = "block"
+
+[[case]]
+id = "block-delete-cte-in-insert"
+dialect = "duckdb"
+sql = "with d as (delete from users returning *) insert into x select * from d"
+expect = "block"
+
+[[case]]
+id = "block-delete-cte-inside-insert-select"
+dialect = "duckdb"
+sql = "insert into x with d as (delete from users returning *) select * from d"
+expect = "block"
+
+[[case]]
+id = "block-update-cte-in-create-as"
+dialect = "duckdb"
+sql = "create table y as with d as (update events set amount = 0 returning *) select * from d"
+expect = "block"
+
+[[case]]
+id = "ok-create-as-with-cte"
+dialect = "duckdb"
+sql = "create table y as with c as (select id from events) select * from c"
+expect = "write"

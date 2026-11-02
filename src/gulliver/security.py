@@ -21,8 +21,10 @@ Per connection, set by the human in gulliver.toml:
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -66,14 +68,16 @@ for _code, _names in {
         pg_log_backend_memory_contexts pg_import_system_collations pg_stat_reset pg_stat_reset_shared
         pg_stat_reset_single_table_counters pg_stat_reset_single_function_counters pg_stat_reset_slru
         pg_stat_reset_replication_slot pg_stat_reset_subscription_stats pg_stat_statements_reset
+        pg_log_standby_snapshot pg_sync_replication_slots
         system$cancel_query system$cancel_all_queries system$abort_session system$abort_transaction""",
     "GS002": """set_config nextval setval pg_notify pg_advisory_lock pg_advisory_lock_shared pg_advisory_xact_lock
         pg_advisory_xact_lock_shared pg_try_advisory_lock pg_try_advisory_lock_shared pg_try_advisory_xact_lock
         pg_try_advisory_xact_lock_shared pg_advisory_unlock pg_advisory_unlock_shared pg_advisory_unlock_all
-        lo_create lo_creat lo_unlink lo_put lo_from_bytea lo_truncate lowrite""",
+        lo_create lo_creat lo_unlink lo_put lo_from_bytea lo_truncate lowrite
+        brin_summarize_new_values brin_summarize_range brin_desummarize_range gin_clean_pending_list""",
     "GS003": """dblink dblink_exec dblink_open dblink_fetch dblink_close dblink_send_query dblink_get_result
         dblink_connect dblink_connect_u query_to_xml query_to_xmlschema query_to_xml_and_xmlschema cursor_to_xml
-        cursor_to_xmlschema ts_stat pg_background_launch query query_table json_execute_serialized_sql
+        cursor_to_xmlschema ts_stat ts_rewrite pg_background_launch query query_table json_execute_serialized_sql
         postgres_query postgres_execute mysql_query mysql_execute external_query""",
     "GS004": """pg_read_file pg_read_binary_file pg_stat_file pg_ls_dir pg_ls_logdir pg_ls_waldir pg_ls_tmpdir
         pg_ls_archive_statusdir pg_ls_logicalsnapdir pg_ls_logicalmapdir pg_ls_replslotdir pg_file_write
@@ -101,6 +105,7 @@ FILE_FUNCTIONS = _words("""read_csv read_csv_auto read_tsv read_parquet parquet_
     parquet_file_metadata parquet_kv_metadata parquet_bloom_probe read_json read_json_auto read_json_objects
     read_json_objects_auto read_ndjson read_ndjson_auto read_ndjson_objects sniff_csv glob delta_scan iceberg_scan
     iceberg_metadata iceberg_snapshots read_xlsx st_read st_read_meta read_avro sqlite_scan
+    read_duckdb read_single_csv_file read_single_json_file read_single_parquet_file parquet_full_metadata
     read_text read_blob""")  # the last two are refused by name, and path-checked when a human allows them
 
 REMOTE_PREFIXES = ("http://", "https://", "s3://", "s3a://", "s3n://", "gs://", "gcs://", "r2://", "az://",
@@ -159,8 +164,19 @@ def _as_bool(value: Any, key: str, conn_name: str) -> bool:
     raise ConfigError(f"Connection '{conn_name}': {key} must be true or false.")
 
 
+def too_broad(root: str) -> bool:
+    """True for '/', the home folder and any folder above it: reading there reaches ~/.aws, ~/.ssh and the rest."""
+    real = os.path.realpath(root).rstrip(os.sep) + os.sep
+    home = os.path.realpath(os.path.expanduser("~")).rstrip(os.sep) + os.sep
+    return home.startswith(real)
+
+
 def allowed_roots(conn: Connection, cwd: str | None = None) -> list[str]:
-    """Absolute folders a DuckDB connection may read: allowed_paths, or the database file's folder + cwd."""
+    """Absolute folders a DuckDB connection may read: allowed_paths, or the database file's folder + cwd.
+
+    The default folders are dropped when they are too broad ('/', the home folder or above it): MCP clients often
+    start servers there, and that would open the whole disk or the human's credentials. allowed_paths is used as
+    the human wrote it (the selftest fails on a too broad folder)."""
     base = cwd or os.getcwd()
     configured = _as_list(conn.params.get("allowed_paths"), "allowed_paths", conn.name)
     if configured:
@@ -170,6 +186,7 @@ def allowed_roots(conn: Connection, cwd: str | None = None) -> list[str]:
         path = str(conn.params.get("path") or ":memory:")
         if path != ":memory:":
             roots.insert(0, os.path.dirname(os.path.abspath(os.path.join(base, os.path.expanduser(path)))))
+        roots = [r for r in roots if not too_broad(r)]
     out: list[str] = []
     for root in roots:
         if root not in out:
@@ -255,11 +272,66 @@ def looks_like_path(name: str) -> bool:
                            or any(ch in name for ch in "*?") or bool(_FILE_LIKE.search(name)))
 
 
-def _hidden_part(parts: list[str]) -> str | None:
+_GLOB = "*?[{"
+
+
+def _hidden_part(parts: list[str], glob: bool = False) -> str | None:
+    """The first part that is hidden. With glob=True also a glob part that can match a hidden name by its first
+    character ('[.]env', '?env'); a leading '*' is checked against the files it matches (see _glob_matches)."""
     for part in parts:
         if part.startswith(".") and part not in (".", ".."):
             return part
+        if glob and part[:1] in ("?", "["):
+            return part
     return None
+
+
+def _glob_matches(pattern: str) -> Iterator[str]:
+    """Every existing path an absolute DuckDB glob can match. Unlike Python's glob, '*', '?', '[...]' and '**'
+    match hidden names too, as they do in DuckDB."""
+    parts = [p for p in re.split(r"[\\/]", pattern) if p]
+
+    def walk(cur: str, i: int) -> Iterator[str]:
+        if i == len(parts):
+            if os.path.lexists(cur):
+                yield cur
+            return
+        part = parts[i]
+        if part == "**":
+            seen: set[str] = set()
+            for folder, dirs, _ in os.walk(cur, followlinks=True):
+                real = os.path.realpath(folder)
+                if real in seen:  # a symlink loop
+                    dirs[:] = []
+                    continue
+                seen.add(real)
+                yield from walk(folder, i + 1)
+            return
+        if not any(ch in part for ch in _GLOB):
+            yield from walk(os.path.join(cur, part), i + 1)
+            return
+        try:
+            names = sorted(os.listdir(cur))
+        except OSError:
+            return
+        for name in names:
+            if fnmatch.fnmatchcase(name, part):
+                yield from walk(os.path.join(cur, name), i + 1)
+
+    yield from walk(os.sep, 0)
+
+
+def _place(full: str, policy: SecurityPolicy, base: str) -> tuple[bool, str | None]:
+    """(inside an allowed folder, the hidden part below that folder or None) for a resolved path."""
+    inside, hidden = False, None
+    for root in policy.allowed_paths or ():
+        real_root = os.path.realpath(os.path.join(base, root))
+        if full == real_root or full.startswith(real_root.rstrip(os.sep) + os.sep):
+            part = _hidden_part(list(Path(os.path.relpath(full, real_root)).parts))
+            if part is None:
+                return True, None
+            inside, hidden = True, hidden or part
+    return inside, hidden
 
 
 def check_path(raw: str, policy: SecurityPolicy) -> Violation | None:
@@ -275,29 +347,42 @@ def check_path(raw: str, policy: SecurityPolicy) -> Violation | None:
         return Violation("GS004", f"reads the remote URL '{raw}' (allowed remote prefixes: {allowed}). "
                                   "A human can set allow_remote on the connection in gulliver.toml.", raw)
     expanded = os.path.expanduser(text)
-    if policy.allowed_paths is None:
-        hidden = _hidden_part(re.split(r"[\\/]", expanded))
-        if hidden:
-            return Violation("GS004", f"reads the hidden path '{raw}' ({hidden}); hidden files often hold "
-                                      "credentials or Gulliver's own state.", raw)
-        return None
-    base = policy.base_dir or os.getcwd()
-    cut = min([i for i in (expanded.find(ch) for ch in "*?[{") if i >= 0], default=-1)
+
+    def hidden_violation(part: str) -> Violation:
+        why = (" A name may not start with '?' or '[' in a glob, because that can match a leading dot."
+               if part[:1] in ("?", "[") else "")
+        return Violation("GS004", f"reads the hidden path '{raw}' ({part}); hidden files often hold "
+                                  f"credentials or Gulliver's own state.{why}", raw)
+
+    outside = Violation("GS004", f"reads '{raw}', which is outside the allowed folders "
+                                 f"({', '.join(policy.allowed_paths or ()) or 'none'}). A human can add a folder "
+                                 "to allowed_paths on the connection in gulliver.toml.", raw)
+    cut = min([i for i in (expanded.find(ch) for ch in _GLOB) if i >= 0], default=-1)
     fixed = expanded if cut < 0 else os.path.dirname(expanded[:cut])
-    full = os.path.realpath(os.path.join(base, fixed or "."))
-    for root in policy.allowed_paths:
-        real_root = os.path.realpath(os.path.join(base, root))
-        if full == real_root or full.startswith(real_root.rstrip(os.sep) + os.sep):
-            rel_parts = list(Path(os.path.relpath(full, real_root)).parts)
-            tail = re.split(r"[\\/]", expanded[len(fixed):]) if cut >= 0 else []  # the glob part, as written
-            hidden = _hidden_part(rel_parts + tail)
+    tail = [p for p in re.split(r"[\\/]", expanded[len(fixed):]) if p] if cut >= 0 else []  # the glob part
+    if policy.allowed_paths is None:
+        hidden = _hidden_part(re.split(r"[\\/]", expanded[:len(fixed)])) or _hidden_part(tail, glob=True)
+        return hidden_violation(hidden) if hidden else None
+    if ".." in tail:  # 'su?/../../x' would leave the folder that the part before the glob is checked against
+        return Violation("GS004", f"reads '{raw}', which uses '..' after a glob character, so Gulliver cannot "
+                                  "tell which folder it reads. Write the folder without '..'.", raw)
+    base = policy.base_dir or os.getcwd()
+    inside, hidden = _place(os.path.realpath(os.path.join(base, fixed or ".")), policy, base)
+    if not inside:
+        return outside
+    hidden = hidden or _hidden_part(tail, glob=True)
+    if hidden:
+        return hidden_violation(hidden)
+    if cut >= 0:  # '*env' or '**/credentials' can match hidden files: check what the glob matches now
+        for match in _glob_matches(os.path.join(base, expanded)):
+            inside, hidden = _place(os.path.realpath(match), policy, base)
+            if not inside:
+                return outside
             if hidden:
-                return Violation("GS004", f"reads the hidden path '{raw}' ({hidden}); hidden files often hold "
-                                          "credentials or Gulliver's own state.", raw)
-            return None
-    return Violation("GS004", f"reads '{raw}', which is outside the allowed folders "
-                              f"({', '.join(policy.allowed_paths) or 'none'}). A human can add a folder to "
-                              "allowed_paths on the connection in gulliver.toml.", raw)
+                return Violation("GS004", f"reads '{raw}', which matches a hidden file or folder ({hidden}); "
+                                          "hidden files often hold credentials or Gulliver's own state. "
+                                          "Write a pattern that matches only the data files.", raw)
+    return None
 
 
 def _function_violation(name: str, kind: str, policy: SecurityPolicy) -> Violation | None:
@@ -481,6 +566,10 @@ def _sandbox_checks(conn: Connection) -> list[dict[str, Any]]:
             add("settings locked", False, "SET enable_external_access = true was accepted")
         except Exception:
             add("settings locked", True, "SET is refused (lock_configuration)")
+        broad = [r for r in allowed_roots(conn) if too_broad(r)]
+        add("allowed folders are narrow", not broad,
+            f"too broad (the whole disk or the home folder): {', '.join(broad)}" if broad else
+            "no allowed folder is '/', the home folder or above it")
         name = "file outside allowed_paths is refused by DuckDB"
         with tempfile.TemporaryDirectory(prefix="gulliver-selftest-") as tmp:
             outside = os.path.join(tmp, "outside.csv")

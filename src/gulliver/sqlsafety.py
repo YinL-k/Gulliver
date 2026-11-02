@@ -25,6 +25,9 @@ from .security import SecurityPolicy
 from .security import check as security_check
 
 READ_ROOTS = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)
+# Statements that change data or schema. Inside another statement (a CTE such as WITH d AS (DELETE ... RETURNING *))
+# they would run as a side effect of a read or of an INSERT/CREATE ... SELECT, so they are refused there.
+DATA_CHANGING = (exp.Insert, exp.Delete, exp.Update, exp.Create, exp.Drop, exp.Merge)
 
 
 @dataclass
@@ -113,9 +116,11 @@ def _classify(sql: str, dialect: str) -> Statement:
         return Statement(sql, dialect, "block", reason="Send exactly one statement at a time.")
     tree = trees[0]
 
+    if isinstance(tree, (*READ_ROOTS, exp.Create, exp.Insert)) and any(
+            isinstance(node, DATA_CHANGING) for node in tree.walk() if node is not tree):
+        return Statement(sql, dialect, "block", reason="Data-changing statement nested inside a query.", tree=tree)
+
     if isinstance(tree, READ_ROOTS):
-        if any(isinstance(node, (exp.Insert, exp.Delete, exp.Update, exp.Create, exp.Drop)) for node in tree.walk()):
-            return Statement(sql, dialect, "block", reason="Data-changing statement nested inside a query.", tree=tree)
         if any(isinstance(node, exp.Select) and node.args.get("into") for node in tree.walk()):
             return Statement(sql, dialect, "block", reason="SELECT ... INTO writes a table; use CREATE TABLE ... AS SELECT.",
                              tree=tree)

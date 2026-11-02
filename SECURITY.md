@@ -70,10 +70,13 @@ gulliver selftest security          # exit 0 when every case and sandbox check p
   not depend on names, but for Postgres, BigQuery and Snowflake the parser is the only Gulliver-side check.
   **Give Gulliver a read-only database role** (Postgres `pg_read_all_data` or plain `SELECT` grants; a BigQuery
   service account with `roles/bigquery.dataViewer` + `jobUser`; a Snowflake role with only `SELECT`).
-  Gulliver also opens Postgres sessions read-only, which stops writes but not functions such as
-  `pg_terminate_backend`.
+  Gulliver also opens Postgres sessions read-only, which stops most writes but not functions such as
+  `pg_terminate_backend`, `brin_summarize_new_values` (writes index pages) or `pg_log_standby_snapshot` (writes
+  WAL). The known ones are on the denylist; a role without ownership of indexes and without superuser stops the
+  rest.
 - **Reading allowed data.** Anything inside `allowed_paths` (by default the database file's folder and the
-  current folder) can be read, except hidden files and folders. Keep secrets out of those folders, or set
+  current folder; a folder that is `/`, the home folder or above it is left out) can be read, except hidden
+  files and folders, also when a glob such as `[.]env`, `*env` or `**/credentials` would match them. Keep secrets out of those folders, or set
   `allowed_paths` to the data folder only.
 - **Slow or heavy reads** such as `pg_sleep` or a huge cross join are budget problems, not security ones: the
   runtime limit and the scan limits handle them.

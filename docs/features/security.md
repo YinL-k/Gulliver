@@ -10,13 +10,23 @@ Gulliver now refuses them before anything reaches the database, with a code the 
 
 | Code | Name | Refuses |
 |---|---|---|
-| `GS001` | server-control | `pg_terminate_backend`, `pg_cancel_backend`, `pg_reload_conf`, `pg_switch_wal`, replication slots, `pg_stat_reset`, `SYSTEM$CANCEL_QUERY`, `SYSTEM$ABORT_SESSION`, any Snowflake `SYSTEM$` function not known to be read-only |
-| `GS002` | session-state | `set_config`, advisory locks, `pg_notify`, `nextval`/`setval` in a read (Snowflake `seq.NEXTVAL` too), large-object writes, `SELECT ... FOR UPDATE / FOR SHARE` |
-| `GS003` | dynamic-sql | `dblink*`, `query_to_xml*`, `cursor_to_xml*`, `ts_stat`, DuckDB `query` / `query_table` / `postgres_query`, BigQuery `EXTERNAL_QUERY` |
-| `GS004` | file-access | `pg_read_file`, `pg_ls_dir`, `lo_import`/`lo_export`, DuckDB `read_text`, `read_blob`, `getenv`, `duckdb_secrets`, `http_get`, `postgres_scan`; and any DuckDB file path or URL outside the allowed folders, a hidden file (`.env`, `.gulliver/`), a computed path, `../` or a symlink that leads out |
+| `GS001` | server-control | `pg_terminate_backend`, `pg_cancel_backend`, `pg_reload_conf`, `pg_switch_wal`, replication slots, `pg_stat_reset`, `pg_log_standby_snapshot`, `SYSTEM$CANCEL_QUERY`, `SYSTEM$ABORT_SESSION`, any Snowflake `SYSTEM$` function not known to be read-only |
+| `GS002` | session-state | `set_config`, advisory locks, `pg_notify`, `nextval`/`setval` in a read (Snowflake `seq.NEXTVAL` too), large-object writes, index maintenance that writes (`brin_summarize_new_values`, `brin_summarize_range`, `gin_clean_pending_list`), `SELECT ... FOR UPDATE / FOR SHARE` |
+| `GS003` | dynamic-sql | `dblink*`, `query_to_xml*`, `cursor_to_xml*`, `ts_stat`, `ts_rewrite`, DuckDB `query` / `query_table` / `postgres_query`, BigQuery `EXTERNAL_QUERY` |
+| `GS004` | file-access | `pg_read_file`, `pg_ls_dir`, `lo_import`/`lo_export`, DuckDB `read_text`, `read_blob`, `getenv`, `duckdb_secrets`, `http_get`, `postgres_scan`; and any DuckDB file path or URL outside the allowed folders, a hidden file (`.env`, `.gulliver/`, also written as a glob such as `[.]env`, `?env`, `*env` or `**/credentials`), a computed path, `../` (also after a glob, as in `su?/../../x`) or a symlink that leads out. File readers include `read_duckdb`, `read_single_*_file` and `parquet_full_metadata` |
 
 Names are matched after lower-casing and removing the schema, quotes and `U&"..."` escapes, everywhere in the
 statement: CTEs, subqueries, `LATERAL`, UNION branches, and the SELECT part of a write.
+
+**Globs.** A glob can match a hidden name without writing the dot (`[.]env`, `?env`, `*env`, `**/credentials`).
+A glob name that starts with `?` or `[` is refused outright. For `*` and `**` Gulliver lists what the glob matches
+right now (hidden names included, as DuckDB does) and refuses the query when any match is hidden, or resolves
+outside the allowed folders. `..` after a glob character is refused.
+
+**Default folders.** Without `allowed_paths`, the database folder and the current folder are allowed, except
+when one of them is `/`, the home folder or a folder above it (MCP clients often start servers in `/` or in the
+home folder). That folder is then left out; set `allowed_paths` to open it. `gulliver selftest security` fails
+when an allowed folder is that broad.
 
 **The DuckDB sandbox.** The parser is a denylist, so DuckDB is also locked at the engine. Every DuckDB connection
 Gulliver opens runs:
@@ -39,7 +49,7 @@ as before.
 [connections.lake]
 engine = "duckdb"
 path = "warehouse.duckdb"
-allowed_paths = ["data", "/srv/lake"]   # folders that may be read; default: the database folder + current folder
+allowed_paths = ["data", "/srv/lake"]   # folders that may be read; default: the database folder + current folder (not /, ~ or above ~)
 allow_remote = ["s3://my-bucket/"]      # or true for any URL (default false); httpfs must already be installed
 allow_functions = ["read_text"]         # lift the name check for these functions; path checks still apply
 sandbox = true                          # false turns off the engine sandbox (the parser still checks)
