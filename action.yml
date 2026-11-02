@@ -189,8 +189,14 @@ runs:
         GV_REPORT: ${{ steps.review.outputs.report }}
       run: |
         marker='<!-- gulliver-review -->'
+        # Only our own comment: written by this token's user and starting with the marker. Anyone can paste
+        # the marker into a comment; that one must not be overwritten or left as the "current" report.
+        # GITHUB_TOKEN cannot read /user; its comments are written by github-actions[bot].
+        login=$(gh api user --jq .login 2> /dev/null) || login=''
+        if [ -z "$login" ] || [ "$login" = "null" ]; then login='github-actions[bot]'; fi
         id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${GV_PR}/comments" --paginate \
-          --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n 1)
+          --jq ".[] | select(.user.login == \"${login}\" and (.body | startswith(\"${marker}\"))) | .id" \
+          | head -n 1)
         if [ -n "$id" ]; then
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -F "body=@${GV_REPORT}" > /dev/null
         else

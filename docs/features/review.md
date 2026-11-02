@@ -11,8 +11,9 @@ For every `.sql` model that changed between a base ref and head, it reports:
 - **New scale lint**: findings in the new version that the old one did not have (GV002 "no LIMIT" is skipped:
   a model is meant to return all its rows).
 - **Change type**: `cosmetic` (same SQL after normalizing formatting, comments, identifier case and table
-  aliases), `non_breaking` (only output columns added), or `breaking` (a column removed, retyped or computed
-  differently, or WHERE / JOIN / GROUP BY / other row clauses changed, or the model deleted or renamed).
+  aliases; aliases are kept when two tables share a name, such as `prod.orders` and `archive.orders`),
+  `non_breaking` (only output columns added), or `breaking` (a column removed, retyped or computed
+  differently, an unaliased expression compared by position as `_col_<n>`, or WHERE / JOIN / GROUP BY / other row clauses changed, or the model deleted or renamed).
 - **Downstream impact**: which models use the removed or changed columns (or the whole model, when its rows can
   change), from column-level lineage of the head version.
 - **Cost, with a connection**: both versions are preflighted (estimate only, nothing runs). It shows the scan and
@@ -90,8 +91,9 @@ Each changed model also gets a collapsed details block (reasons, downstream colu
 ### GitHub Action
 
 `action.yml` at the repository root is a composite action. It installs Gulliver from the action's own source (or
-`package:`), runs the review, writes the report to the job summary, posts or updates **one** PR comment (found by
-the `<!-- gulliver-review -->` marker), optionally uploads SARIF, and fails the job on `block`.
+`package:`), runs the review, writes the report to the job summary, posts or updates **one** PR comment (its own: written by
+the token's user, `github-actions[bot]` for the default token, and starting with the `<!-- gulliver-review -->`
+marker; a comment someone else writes with the marker is never touched), optionally uploads SARIF, and fails the job on `block`.
 
 ```yaml
 on: pull_request
@@ -121,7 +123,8 @@ read-only: the comment step warns and the gate still runs.
 ### Guarantees
 
 - No base, no review: a missing base ref, no shared history (shallow clone) or a missing, empty or foreign base
-  manifest gives `block`, never "review everything".
+  manifest gives `block`, never "review everything". A `--models` folder that is in neither the base, the head nor
+  the checkout (a typo) gives `block` too, never "no SQL model changed".
 - Without `--rehearse` nothing runs: cost comes from the engine's estimate (BigQuery dry run, EXPLAIN elsewhere)
   and goes through the same preflight as `gulliver preflight`. With `--rehearse`, sample runs go through the same
   budget checks and ledger as `gulliver rehearse`.

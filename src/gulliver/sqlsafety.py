@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ParseError
+from sqlglot.errors import SqlglotError
 
 from .security import SecurityPolicy
 from .security import check as security_check
@@ -111,7 +111,7 @@ def _classify(sql: str, dialect: str) -> Statement:
         return Statement(sql, dialect, "block", reason="Empty SQL.")
     try:
         trees = [t for t in sqlglot.parse(text, read=dialect) if t is not None]
-    except ParseError as exc:
+    except SqlglotError as exc:   # ParseError and TokenError (e.g. Postgres `IN ($1,$2)`, an open quote)
         first = str(exc).splitlines()[0] if str(exc) else "parse error"
         return Statement(sql, dialect, "block", reason=f"Could not parse SQL for dialect '{dialect}': {first}")
     if len(trees) != 1:

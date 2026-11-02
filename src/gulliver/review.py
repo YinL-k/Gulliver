@@ -149,15 +149,23 @@ def _pathspec(prefix: str) -> list[str]:
 
 
 def _read_tree(repo: Path, rev: str, prefix: str) -> dict[str, str]:
-    """Every .sql file under prefix at rev, read with one `git cat-file --batch`."""
-    listing = _git(repo, "ls-tree", "-r", "-z", "--full-tree", "--name-only", rev, *_pathspec(prefix))
-    names = [n for n in listing.decode("utf-8", "replace").split("\0") if n.endswith(".sql")]
-    if not names:
+    """Every .sql file under prefix at rev, read with one `git cat-file --batch`.
+
+    cat-file gets the blob ids, not `rev:path`: its input is one line per object, so a file name with a newline
+    in it would split into two requests and shift every later file onto the wrong content."""
+    listing = _git(repo, "ls-tree", "-r", "-z", "--full-tree", rev, *_pathspec(prefix))
+    blobs: list[tuple[str, str]] = []
+    for entry in listing.decode("utf-8", "replace").split("\0"):
+        meta, sep, name = entry.partition("\t")   # "<mode> <type> <sha>\t<path>"
+        fields = meta.split()
+        if sep and len(fields) == 3 and fields[1] == "blob" and name.endswith(".sql"):
+            blobs.append((name, fields[2]))
+    if not blobs:
         return {}
-    data = _git(repo, "cat-file", "--batch", stdin="".join(f"{rev}:{n}\n" for n in names).encode("utf-8"))
+    data = _git(repo, "cat-file", "--batch", stdin="".join(f"{sha}\n" for _, sha in blobs).encode("ascii"))
     out: dict[str, str] = {}
     pos = 0
-    for name in names:
+    for name, _ in blobs:
         end = data.index(b"\n", pos)
         header = data[pos:end].decode("utf-8", "replace")
         pos = end + 1
@@ -242,7 +250,8 @@ def _canonical(tree: exp.Expression) -> exp.Expression:
     tree = tree.copy()
     tables = [t for t in tree.find_all(exp.Table) if isinstance(t.this, exp.Identifier)]
     names = [lineage.table_name(t) for t in tables]
-    if len(names) != len(set(names)):
+    # qualifiers are rewritten to the last name part, so prod.orders and archive.orders must not both appear
+    if len(names) != len(set(names)) or len({n.split(".")[-1] for n in names}) != len(names):
         return tree
     aliases = {t.alias.lower(): lineage.table_name(t) for t in tables if t.alias}
     for t in tables:
@@ -280,8 +289,9 @@ def _projections(tree: exp.Expression) -> dict[str, exp.Expression]:
     if not isinstance(tree, exp.Select):
         return {}
     out: dict[str, exp.Expression] = {}
-    for p in tree.expressions:
-        key = p.sql().lower() if _is_star(p) else p.alias_or_name.lower()
+    for i, p in enumerate(tree.expressions):
+        # an unaliased expression (a + 1, SUM(a)) has no name: key it by position as sqlglot's lineage does
+        key = p.sql().lower() if _is_star(p) else (p.alias_or_name.lower() or f"_col_{i}")
         out[key] = p.unalias() if isinstance(p, exp.Alias) else p
     return out
 
@@ -451,6 +461,13 @@ def _collect_git(models_dir: str, base: str, head: str, repo: str | None, ref_sc
                 "head": {"ref": head, "sha": head_sha}, "reason": "no_merge_base",
                 "next_step": "base and head share no history in this checkout (a shallow clone?). Fetch more "
                              "history, e.g. actions/checkout with fetch-depth: 0, and run again."}
+    if prefix and not (top / prefix).is_dir() and not any(
+            _git(top, "ls-tree", "--full-tree", rev, "--", prefix).strip() for rev in (merge_base, head_sha)):
+        return {"status": "block", "action": "review", "base": {"ref": base, "sha": base_sha},
+                "head": {"ref": head, "sha": head_sha}, "reason": "models_dir_missing", "models_dir": prefix,
+                "next_step": f"The models folder '{models_dir}' is in neither the base, the head nor the checkout, "
+                             "so nothing can be reviewed (a typo would otherwise pass every PR). Pass the folder "
+                             "that holds the .sql models, e.g. --models models."}
     changes = _changed_files(top, base_sha, head_sha, prefix)
     base_texts = _read_tree(top, merge_base, prefix)
     head_texts = _read_tree(top, head_sha, prefix)

@@ -91,20 +91,26 @@ The JSON has the same data per group: `fingerprint`, `calls`, `calls_per_day`, `
 #### Limits
 
 - Per-month numbers assume the next 30 days repeat the window that was read. `exact` describes the estimates, not
-  the future workload.
+  the future workload. A window shorter than one day (right after a `pg_stat_statements` reset) gets no per-month
+  numbers and no summary-table candidates; a note says how many hours were read.
 - The fix is computed on one example per group. The other literal variants have the same shape, but a rewrite that
   depends on a literal (a date range) is shown for that example.
 - `pg_stat_statements` counts since its last reset, not per day. With Postgres 14+ the reset time comes from
   `pg_stat_statements_info`; without it there is no per-month projection. Its queries carry `$1` parameters instead of
-  literals, so the date rewrite does not apply to them; lint still runs. Bytes are shared buffer blocks x 8 KiB. The
+  literals, so the date rewrite does not apply to them; lint still runs. Text such as `IN ($1,$2)` cannot be parsed
+  (sqlglot reads `$1,$` as a dollar quote): that group is still ranked, with `analysis.kind` `block` and the reason.
+  Session and utility statements (SET, EXPLAIN, ...), system catalog lookups and reads of `pg_stat_statements`,
+  Gulliver's own included, are left out; a note counts them. Bytes are shared buffer blocks x 8 KiB. The
   extension must be in `shared_preload_libraries`; without it `top` returns an error that says so.
 - BigQuery: the money is the on-demand price. With capacity (slot) pricing it follows slot time instead. Jobs are
   read for the connection's `location` only. The role needs `bigquery.jobs.listAll`.
 - Snowflake: `ACCOUNT_USAGE` needs a privileged role (`SNOWFLAKE.GOVERNANCE_VIEWER`, plus `SNOWFLAKE.USAGE_VIEWER`
   for attribution) and lags up to 45 minutes (attribution up to 8 hours). Attributed credits leave out warehouse
-  idle time.
+  idle time. Runs without an attribution row (recent or very short ones) count with the estimate, and the cost basis
+  says "credits attributed per query" only when every run of every group was attributed.
 - `receipts` only knows queries that ran through `gulliver run`.
-- A file is taken to cover `--days` days.
+- A file is taken to cover `--days` days. CSV may be saved with a UTF-8 byte order mark (Excel) and may hold
+  multi-line SQL in quoted fields. Rows whose numbers do not parse (or are `inf` / `nan`) are skipped and counted.
 - Summary-table pricing assumes one refresh costs about one run and that reading the summary is close to free.
   Groups with many literal variants need the filtered columns as GROUP BY keys, and such a refresh can cost more.
   This saving and the rewrite saving for the same query overlap; do not add them up.

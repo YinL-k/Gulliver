@@ -124,6 +124,38 @@ def test_bad_inputs(settings, tmp_path):
     assert workload.top(settings, days=0)["status"] == "error"
 
 
+def test_csv_keeps_newlines_in_quoted_sql_and_reads_a_bom(settings, tmp_path):
+    path = tmp_path / "multi.csv"
+    _write_csv(path, [{"query": "SELECT * -- all columns\nFROM events", "calls": 100, "cost_usd": 50},
+                      {"query": "SELECT * -- all columns\nFROM users", "calls": 100, "cost_usd": 1}])
+    path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8-sig")  # as Excel's "CSV UTF-8" saves it
+    r = workload.top(settings, path=str(path))
+    assert r["totals"]["groups"] == 2 and r["top"][0]["cost_usd"] == pytest.approx(50.0)
+    assert r["top"][0]["sql"] == "SELECT * -- all columns\nFROM events"
+    assert r["top"][0]["analysis"]["tables"] == ["events"]
+
+
+def test_file_rows_with_infinite_numbers_are_skipped(settings, tmp_path):
+    path = tmp_path / "inf.csv"
+    path.write_text("query,calls,bytes,cost_usd\nSELECT 1,inf,1,1\nSELECT 2,1,1,nan\nSELECT 3,1,1,1\n",
+                    encoding="utf-8")
+    r = workload.top(settings, path=str(path))
+    assert r["totals"]["queries"] == 1 and any("2 row(s) skipped" in n for n in r["notes"])
+
+
+def test_postgres_parameters_that_cannot_be_tokenized_do_not_crash(settings, tmp_path):
+    path = tmp_path / "pg.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in [
+        {"query": "SELECT * FROM t WHERE a IN ($1,$2)", "calls": 100},
+        {"query": "SELECT g FROM generate_series($3,$4) g", "calls": 50},
+        {"query": "SELECT a FROM t WHERE b = $1", "calls": 10},
+    ]), encoding="utf-8")
+    r = workload.top(settings, path=str(path), dialect="postgres")
+    assert r["status"] in ("ok", "warn") and r["totals"]["groups"] == 3
+    assert r["top"][0]["analysis"]["kind"] == "block" and "Could not parse" in r["top"][0]["analysis"]["reason"]
+    assert r["top"][2]["analysis"]["kind"] == "read"
+
+
 # -- receipts source ------------------------------------------------------------------------------
 def test_receipts_source_counts_full_runs(settings):
     for day in ("2025-01-01", "2025-01-02", "2025-01-03"):
@@ -321,6 +353,35 @@ def test_snowflake_history_with_attribution(sf_settings, monkeypatch):
     assert r["cost_basis"] == "credits attributed per query"
 
 
+def test_snowflake_history_sql_counts_unattributed_runs_with_the_estimate():
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA hist")
+    con.execute("CREATE TABLE hist.qh AS SELECT 'q' || i AS query_id, 'p1' AS query_parameterized_hash, "
+                "'select 1' AS query_text, 'h1' AS query_hash, 100 AS bytes_scanned, 3600000 AS execution_time, "
+                "'Medium' AS warehouse_size, now() AS start_time, 'SUCCESS' AS execution_status FROM range(10) t(i)")
+    con.execute("CREATE TABLE hist.qa AS SELECT 'q0' AS query_id, 4.0 AS credits_attributed_compute")
+    sql = (workload.snowflake_history_sql(7)
+           .replace("SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY", "hist.qh")
+           .replace("SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY", "hist.qa")
+           .replace("DATEADD('day', -7, CURRENT_TIMESTAMP())", "now() - INTERVAL 7 DAY"))
+    row = con.execute(f"SELECT gv_credits, gv_attributed, gv_credits_est FROM ({sql})").fetchone()
+    assert row == (40.0, 1, 40.0)  # 1 attributed run (4 credits) + 9 estimated runs (4 credits each)
+
+
+def test_snowflake_partly_attributed_groups_are_labeled(sf_settings, monkeypatch):
+    rows = [{"GV_HASH": "p1", "GV_QUERY": "select 1", "GV_CALLS": 10, "GV_CREDITS": 40.0, "GV_ATTRIBUTED": 1,
+             "GV_CREDITS_EST": 40.0}]
+    monkeypatch.setattr(workload, "_gated_run", lambda *a, **k: {"rows": rows, "cost_usd": 0})
+    history = workload.read_snowflake_history(sf_settings, "sf", SimpleNamespace(credit_usd=2.0), 7)
+    assert history.entries[0].cost_usd == pytest.approx(80.0)
+    assert "where available" in history.cost_basis
+    rows[0]["GV_ATTRIBUTED"] = 10
+    history = workload.read_snowflake_history(sf_settings, "sf", SimpleNamespace(credit_usd=2.0), 7)
+    assert history.cost_basis == "credits attributed per query"
+
+
 def test_snowflake_falls_back_without_attribution(sf_settings, monkeypatch):
     fake = FakeSnowConn(deny_attribution=True)
     _patch_engine(monkeypatch, lambda conn: SnowflakeEngine(conn, _conn=fake))
@@ -358,13 +419,14 @@ class FakePgCursor:
             self._rows = [([{"Plan": {"Node Type": "Result", "Plan Rows": 1, "Plan Width": 8}}],)]
         elif "pg_stat_statements_info" in sql:
             self.description = [SimpleNamespace(name="gv_since")]
-            self._rows = [("2026-10-19 00:00:00+00:00",)]
+            self._rows = [(self.conn.since,)]
         elif "FROM pg_stat_statements" in sql:
             self.description = [SimpleNamespace(name=n) for n in ("gv_hash", "gv_query", "gv_calls", "gv_ms",
                                                                    "gv_blocks")]
             self._rows = [(11, "select * from orders where id = $1", 5000, 90_000.0, 20),
                           (12, "<insufficient privilege>", 9, 1.0, 1),
-                          (13, "select count(*) from orders where status = $1", 10, 120_000.0, 9000)]
+                          (13, "select count(*) from orders where status = $1", 10, 120_000.0, 9000),
+                          *self.conn.extra]
 
     def fetchall(self):
         return self._rows
@@ -375,8 +437,8 @@ class FakePgCursor:
 
 
 class FakePgConn:
-    def __init__(self, missing=False, old=False):
-        self.sql, self.missing, self.old = [], missing, old
+    def __init__(self, missing=False, old=False, since="2026-10-19 00:00:00+00:00", extra=()):
+        self.sql, self.missing, self.old, self.since, self.extra = [], missing, old, since, list(extra)
 
     def cursor(self):
         return FakePgCursor(self)
@@ -406,6 +468,47 @@ def test_pg_stat_statements_without_reset_time_has_no_projection(state, monkeypa
     r = workload.top(_pg_settings(state))
     assert r["window_days"] is None and "calls_per_day" not in r["top"][0]
     assert r["materialize"] == []
+
+
+# Gulliver's own statements as pg_stat_statements records them, and other statements that are not workload
+PG_NOT_WORKLOAD = [
+    (21, "EXPLAIN (FORMAT JSON) SELECT s.queryid AS gv_hash FROM pg_stat_statements AS s", 3, 500_000.0, 1),
+    (22, "SELECT i.stats_reset AS gv_since FROM pg_stat_statements_info AS i", 3, 400_000.0, 1),
+    (23, "SET statement_timeout = 900000", 9, 300_000.0, 0),
+    (24, "SELECT set_config($1, $2, $3)", 9, 300_000.0, 0),
+    (25, "SELECT n.nspname, c.relname, count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+         "GROUP BY 1, 2", 5000, 300_000.0, 10),
+    (26, "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1", 9, 300_000.0, 1),
+    (27, "SELECT pg_relation_size($1)", 9, 300_000.0, 0),
+]
+
+
+def test_pg_stat_statements_leaves_out_gulliver_and_catalog_statements(state, monkeypatch):
+    extra = [*PG_NOT_WORKLOAD, (31, "SELECT * FROM ev WHERE a IN ($1,$2)", 50, 200_000.0, 5)]
+    _patch_engine(monkeypatch, lambda conn: PostgresEngine(conn, _conn=FakePgConn(extra=extra)))
+    r = workload.top(_pg_settings(state))
+    assert r["status"] in ("ok", "warn")
+    sqls = [t["sql"] for t in r["top"]]
+    assert sqls == ["SELECT * FROM ev WHERE a IN ($1,$2)", "select count(*) from orders where status = $1",
+                    "select * from orders where id = $1"]
+    # Postgres keeps `$1,$2` unspaced; sqlglot cannot tokenize it: the group is reported, not a crash
+    assert r["top"][0]["analysis"]["kind"] == "block"
+    assert all("pg_class" not in m["sql"] for m in r["materialize"])
+    assert any("7 statement(s) left out" in n for n in r["notes"])
+
+
+def test_pg_stat_statements_short_window_has_no_projection(state, monkeypatch):
+    from gulliver.store import now_utc
+
+    since = (now_utc() - workload.timedelta(minutes=2)).isoformat()
+    many = [(41, "select region, count(*) from sales group by 1", 5000, 900_000.0, 100)]
+    _patch_engine(monkeypatch, lambda conn: PostgresEngine(conn, _conn=FakePgConn(since=since, extra=many)))
+    r = workload.top(_pg_settings(state))
+    assert 0 < r["window_days"] < 1
+    assert "cost_per_month_usd" not in r["totals"] and r["materialize"] == []
+    assert all("runtime_s_per_month" not in (t.get("analysis", {}).get("saving") or {}) for t in r["top"])
+    assert any("too short to project" in n for n in r["notes"])
+    assert not any("0 day(s)" in n for n in r["notes"])
 
 
 def test_pg_stat_statements_missing_is_a_clear_error(state, monkeypatch):

@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
+import math
 import re
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -53,6 +55,7 @@ RANK_BY = ("auto", "cost", "runtime", "bytes", "calls")
 HISTORY_ROWS = 1000          # query groups read from a warehouse history
 MAX_SQL_CHARS = 2000         # sample SQL handed back per group
 DAYS_PER_MONTH = 30.0
+MIN_PROJECTION_DAYS = 1.0    # shorter windows are too short to scale to a month or to suggest summary tables
 SNOWFLAKE_CREDITS_PER_HOUR = {
     "X-Small": 1, "Small": 2, "Medium": 4, "Large": 8, "X-Large": 16, "2X-Large": 32, "3X-Large": 64,
     "4X-Large": 128, "5X-Large": 256, "6X-Large": 512,
@@ -269,11 +272,14 @@ def read_pg_stat_statements(settings: Settings, conn_name: str, engine: Engine) 
         notes.append("The reset time is unknown (pg_stat_statements_info needs Postgres 14+), so there is no "
                      "per-month projection.")
     entries: list[Entry] = []
-    hidden = 0
+    hidden = internal = 0
     for row in _lowered(res["rows"]):
         query = str(row.get("gv_query") or "")
         if not query or query.startswith("<insufficient privilege>"):
             hidden += 1
+            continue
+        if _pg_not_workload(query):
+            internal += 1
             continue
         blocks = row.get("gv_blocks")
         entries.append(Entry(sql=query, calls=int(row.get("gv_calls") or 0),
@@ -282,7 +288,42 @@ def read_pg_stat_statements(settings: Settings, conn_name: str, engine: Engine) 
                              cost_usd=0.0, engine_hash=str(row.get("gv_hash"))))
     if hidden:
         notes.append(f"{hidden} statement(s) hidden: the role needs pg_read_all_stats to see their text.")
+    if internal:
+        notes.append(f"{internal} statement(s) left out: session and utility statements (SET, EXPLAIN, ...), "
+                     "system catalog lookups and reads of pg_stat_statements itself, including Gulliver's own.")
     return History(entries, window, "Postgres is self-hosted: runtime, not money", notes, cost)
+
+
+_PG_UTILITY = {"SET", "RESET", "SHOW", "BEGIN", "COMMIT", "ROLLBACK", "END", "START", "SAVEPOINT", "RELEASE",
+               "EXPLAIN", "DISCARD", "DEALLOCATE", "PREPARE", "LISTEN", "UNLISTEN", "NOTIFY"}
+_PG_CATALOG_SCHEMAS = {"pg_catalog", "information_schema"}
+_PG_SESSION_FUNCS = {"set_config", "current_setting", "version", "current_database", "current_schema"}
+
+
+def _pg_not_workload(query: str) -> bool:
+    """Statements that are not the database's workload: session and utility statements, system catalog
+    lookups and statistics reads (Gulliver's own introspection, estimates and history query among them)."""
+    text = _COMMENT.sub(" ", query).strip().lstrip("(").strip()
+    first = text.split(None, 1)[0].upper().rstrip(";") if text else ""
+    if first in _PG_UTILITY or "pg_stat_statements" in text.lower():
+        return True
+    if first not in ("SELECT", "WITH"):
+        return False
+    try:
+        trees = [t for t in sqlglot.parse(text.rstrip(";"), read="postgres") if t is not None]
+    except Exception:  # cannot tell: keep it
+        return False
+    if len(trees) != 1:
+        return False
+    tables = [t for t in trees[0].find_all(exp.Table) if t.name]
+    ctes = {c.alias_or_name.lower() for c in trees[0].find_all(exp.CTE)}
+    real = [t for t in tables if not (t.name.lower() in ctes and not t.db)]
+    if real:
+        return all(t.db.lower() in _PG_CATALOG_SCHEMAS or (not t.db and t.name.lower().startswith("pg_"))
+                   for t in real)
+    names = {(f.name if isinstance(f, exp.Anonymous) else f.sql_name()).lower()
+             for f in trees[0].find_all(exp.Func)}
+    return bool(names) and all(n.startswith("pg_") or n in _PG_SESSION_FUNCS for n in names)
 
 
 def bigquery_history_sql(location: str | None, days: int) -> str:
@@ -334,7 +375,12 @@ def read_bigquery_jobs(settings: Settings, conn_name: str, engine: Engine, days:
 
 def snowflake_history_sql(days: int, attribution: bool = True) -> str:
     size_case = " ".join(f"WHEN '{k}' THEN {v}" for k, v in SNOWFLAKE_CREDITS_PER_HOUR.items())
-    credits = "SUM(a.credits_attributed_compute) AS gv_credits, " if attribution else "NULL AS gv_credits, "
+    estimate = f"q.execution_time / 3600000.0 * CASE q.warehouse_size {size_case} ELSE 0 END"
+    # a query without an attribution row (attribution lags up to 8 hours and skips very short queries) counts
+    # with its estimate, so a group is never priced from only the attributed part of its runs
+    credits = (f"SUM(COALESCE(a.credits_attributed_compute, {estimate})) AS gv_credits, "
+               "COUNT(a.credits_attributed_compute) AS gv_attributed, " if attribution else
+               "NULL AS gv_credits, NULL AS gv_attributed, ")
     join = ("LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY AS a ON a.query_id = q.query_id "
             if attribution else "")
     return (
@@ -342,7 +388,7 @@ def snowflake_history_sql(days: int, attribution: bool = True) -> str:
         "COUNT(DISTINCT q.query_hash) AS gv_variants, SUM(q.bytes_scanned) AS gv_bytes, "
         "MIN(q.bytes_scanned) AS gv_bytes_min, MAX(q.bytes_scanned) AS gv_bytes_max, "
         "SUM(q.execution_time) / 1000 AS gv_runtime_s, " + credits +
-        f"SUM(q.execution_time / 3600000.0 * CASE q.warehouse_size {size_case} ELSE 0 END) AS gv_credits_est "
+        f"SUM({estimate}) AS gv_credits_est "
         "FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY AS q " + join +
         f"WHERE q.start_time >= DATEADD('day', -{int(days)}, CURRENT_TIMESTAMP()) "
         "AND q.execution_status = 'SUCCESS' AND q.warehouse_size IS NOT NULL "
@@ -375,9 +421,10 @@ def read_snowflake_history(settings: Settings, conn_name: str, engine: Engine, d
     attributed = 0
     for row in _lowered(res["rows"]):
         credits = _float(row.get("gv_credits"))
-        if credits is not None:
-            attributed += 1
-        else:
+        covered = _int(row.get("gv_attributed"))
+        if credits is not None and (covered is None or covered >= int(row.get("gv_calls") or 0)):
+            attributed += 1   # every run of the group has attributed credits
+        if credits is None:
             credits = _float(row.get("gv_credits_est"))
         entries.append(Entry(
             sql=str(row.get("gv_query") or ""), calls=int(row.get("gv_calls") or 0),
@@ -406,7 +453,7 @@ def read_file(path: str, days: float) -> History:
     target = Path(path).expanduser()
     if not target.is_file():
         raise SourceError(_error(f"File not found: {path}", "Give the path of a CSV or JSONL export."))
-    text = target.read_text(encoding="utf-8")
+    text = target.read_text(encoding="utf-8-sig")   # Excel's "CSV UTF-8" starts with a byte order mark
     suffix = target.suffix.lower()
     rows: list[dict[str, Any]]
     try:
@@ -416,7 +463,7 @@ def read_file(path: str, days: float) -> History:
             loaded = json.loads(text)
             rows = loaded if isinstance(loaded, list) else list(loaded.get("queries") or [])
         else:
-            rows = list(csv.DictReader(text.splitlines()))
+            rows = list(csv.DictReader(io.StringIO(text, newline="")))  # keeps newlines inside quoted SQL
     except (json.JSONDecodeError, csv.Error, AttributeError) as exc:
         raise SourceError(_error(f"Could not read {path}: {exc}",
                                  "Use CSV with a header, or JSON lines, with at least a 'query' column.")) from None
@@ -437,7 +484,7 @@ def read_file(path: str, days: float) -> History:
                                  bytes=_int(got["bytes"]), runtime_s=_float(got["runtime_s"]),
                                  cost_usd=_float(got["cost_usd"]),
                                  engine_hash=str(got["engine_hash"]) if got["engine_hash"] else None))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             skipped += 1
     notes = [f"The file is taken to cover {days:g} day(s) (days); per-month numbers scale from that."]
     if skipped:
@@ -455,13 +502,16 @@ def _lowered(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _int(value: Any) -> int | None:
     if value in (None, ""):
         return None
-    return int(float(value))
+    return int(float(value))   # OverflowError for inf, ValueError for nan
 
 
 def _float(value: Any) -> float | None:
     if value in (None, ""):
         return None
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"not a finite number: {value!r}")
+    return number
 
 
 # -- analysis of one group: lint, safe rewrite, priced saving ----------------------------------
@@ -541,7 +591,7 @@ def price_saving(group: Group, before: dict[str, Any], after: dict[str, Any],
 # -- repeated queries worth a summary table -----------------------------------------------------
 def materialize_candidates(groups: list[Group], dialect: str, window_days: float | None,
                            min_calls_per_day: float, refresh_per_day: float) -> list[dict[str, Any]]:
-    if not window_days:
+    if not window_days or window_days < MIN_PROJECTION_DAYS:
         return []
     out = []
     for g in groups:
@@ -680,7 +730,7 @@ def _report(history: History, dialect: str, engine: Engine | None, limit: int, a
         rank_by = "cost" if any((g.cost_usd or 0) > 0 for g in groups) else "runtime"
     groups.sort(key=lambda g: (_metric(g, rank_by), g.calls), reverse=True)
     window = history.window_days
-    factor = DAYS_PER_MONTH / window if window else None
+    factor = DAYS_PER_MONTH / window if window and window >= MIN_PROJECTION_DAYS else None
     totals: dict[str, Any] = {
         "queries": len(history.entries), "groups": len(groups), "calls": sum(g.calls for g in groups),
         "cost_usd": round(sum(g.cost_usd or 0 for g in groups), 6),
@@ -718,6 +768,9 @@ def _report(history: History, dialect: str, engine: Engine | None, limit: int, a
                               "them up.")
     out["notes"] = history.notes + ["Fixes are computed on one example per group; the other literal variants "
                                     "have the same shape."]
+    if window and not factor:
+        out["notes"].append(f"Only {window * 24:.1f} hour(s) of history: too short to project per month or to "
+                            "suggest summary tables. Run top again after at least a day.")
     if factor:
         out["notes"].append(f"Per-month numbers assume the next 30 days repeat the {round(window, 1):g} day(s) that were "
                             "read. 'exact' means the before/after estimates are the engine's own, not that the "

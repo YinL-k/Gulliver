@@ -112,6 +112,29 @@ def test_classify_change_kinds():
     assert c("select a from t", "select from where")["classification"] == "unknown"
 
 
+def test_unaliased_expressions_are_compared_by_position():
+    c = review.classify_change
+    r = c("SELECT id, a + 1, b + 1 FROM t", "SELECT id, a + 2, b + 1 FROM t")
+    assert r["classification"] == "breaking" and r["columns"]["changed"] == ["_col_1"]
+    assert r["targets"] == ["_col_1"]  # the name sqlglot's lineage gives that column
+    r = c("SELECT id, SUM(a), SUM(b) FROM t GROUP BY id", "SELECT id, SUM(c), SUM(b) FROM t GROUP BY id")
+    assert r["classification"] == "breaking" and r["columns"]["changed"] == ["_col_1"]
+    assert c("SELECT id, a + 1, b + 1 FROM t", "SELECT id,\n a + 1, b + 1 FROM t")["classification"] == "cosmetic"
+
+
+def test_same_named_tables_in_two_schemas_keep_their_aliases():
+    c = review.classify_change
+    join = "FROM prod.orders AS x JOIN archive.orders AS y ON x.id = y.id"
+    assert c(f"SELECT x.amount {join}", f"SELECT y.amount {join}")["classification"] == "breaking"
+    assert c("SELECT x.amount FROM prod.orders AS x LEFT JOIN archive.orders AS y ON x.id = y.id",
+             "SELECT x.amount FROM prod.orders AS x LEFT JOIN archive.orders AS y ON y.id = y.id"
+             )["classification"] == "breaking"
+    # with two tables named orders, renaming the aliases is not treated as cosmetic either
+    assert c(f"SELECT x.amount {join}",
+             "SELECT p.amount FROM prod.orders AS p JOIN archive.orders AS q ON p.id = q.id"
+             )["classification"] == "breaking"  # not canonicalized: conservative, never 'cosmetic' by mistake
+
+
 # -- git mode -------------------------------------------------------------------------------------------
 def test_review_offline_classifies_and_finds_downstream(repo, state):
     r = review.review(None, base="main", head="feature", models_dir=str(repo / "models"))
@@ -170,6 +193,35 @@ def test_review_missing_base_ref_blocks(repo, state):
     r = review.review(None, base="origin/does-not-exist", head="feature", models_dir=str(repo / "models"))
     assert r["status"] == "block" and r["reason"] == "base_missing"
     assert "fetch-depth" in r["next_step"]
+
+
+def test_review_unknown_models_folder_blocks(repo, state):
+    r = review.review(None, base="main", head="feature", models_dir="modles", repo=str(repo))
+    assert r["status"] == "block" and r["reason"] == "models_dir_missing"
+    assert "modles" in r["next_step"]
+    # a folder that exists in the trees is reviewed as usual
+    assert review.review(None, base="main", head="feature", models_dir=str(repo / "models"))["status"] == "block"
+
+
+def test_review_file_name_with_a_newline_does_not_shift_contents(repo, state):
+    (repo / "models" / "a\nb.sql").write_text("select 1 as x\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "odd name")
+    texts = review._read_tree(repo, "HEAD", "models")
+    assert texts["models/a\nb.sql"] == "select 1 as x\n"
+    assert texts["models/report.sql"] == BASE["report.sql"]
+    assert texts["models/user_totals.sql"] == HEAD["user_totals.sql"]
+    r = review.review(None, base="main", head="HEAD", models_dir=str(repo / "models"))
+    assert r["status"] == "block" and "breaking_with_downstream" in {v["kind"] for v in r["violations"]}
+    assert [d["model"] for d in _by_model(r)["user_totals"]["downstream"]] == ["report"]
+
+
+def test_review_model_that_cannot_be_tokenized_is_not_compiled(repo, state):
+    (repo / "models" / "extra.sql").write_text("SELECT 'oops AS a\n", encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "broken quote")
+    r = review.review(None, base="main", head="HEAD", models_dir=str(repo / "models"))
+    assert r["status"] in ("warn", "block")
+    assert _by_model(r)["extra"]["classification"] == "unknown"
 
 
 def test_review_no_changes_is_ok(repo, state):
@@ -323,6 +375,9 @@ def test_action_yml_is_wired():
     text = (Path(__file__).resolve().parents[1] / "action.yml").read_text(encoding="utf-8")
     assert "gulliver review" in text and review.MARKER in text and "GITHUB_STEP_SUMMARY" in text
     assert "upload-sarif" in text and "inputs.sarif" in text
+    # the sticky comment is only ever our own: right author and the marker at the start, not anywhere
+    assert '.user.login == \\"${login}\\"' in text and 'startswith(\\"${marker}\\")' in text
+    assert "contains(" not in text
     # inputs reach the shell only through env: never ${{ }} inside a run script (script injection)
     in_run, indent = False, 0
     for line in text.splitlines():
