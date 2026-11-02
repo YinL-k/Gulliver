@@ -1,0 +1,155 @@
+## MCP-native: approve in the client, resources, prompts, progress, smaller tool sets
+
+Gulliver started as a set of MCP tools. This release uses more of the protocol, so a client can show the human
+an approval form, attach context without a tool call, start the loop from a prompt, show rehearsal progress and
+load fewer tool schemas.
+
+### The problem
+
+- `needs_approval` makes the human switch to a terminal and type `gulliver approve <id>`. Teams then raise the
+  auto-approve limit to avoid it, which is the opposite of what the limit is for.
+- Clients that never read AGENTS.md do not know the loop (inspect, preflight, rehearse, run, receipt).
+- Agents call `gulliver_inspect` again and again for the same context.
+- All 14 tool schemas take about 20 KB of the agent's context, even when the task only needs the query loop.
+- A rehearsal on a slow warehouse looks like a hung call.
+
+### Approval in the MCP client (elicitation), opt-in
+
+A human turns it on in `gulliver.toml`. There is no environment variable and no tool argument for it.
+
+```toml
+[approval]
+channel = "elicitation"   # default "cli": a human runs `gulliver approve <receipt_id>`
+```
+
+When `gulliver_run` would answer `needs_approval`, the server first sends the client a form (MCP elicitation).
+The client shows it to its user:
+
+```text
+Gulliver: approve this query?
+
+An agent wants to run a query that costs more than your auto-approve limit.
+- Connection: local (duckdb)
+- Cost: $3.84 (auto-approve limit $1.00, hard limit $100.00)
+- Scan: 3.7 MB (exact estimate)
+- SQL fingerprint: bdd676276a901c63
+
+SQL:
+select u.country, count(*) as n from events e join users u on e.user_id = u.user_id where e.event_type = 'buy' group by 1
+
+Only you can approve this; the agent cannot. Tick 'approve' and accept to run it now. ...
+```
+
+With a rehearsal on file, the form also shows the predicted runtime, rows and cost range with the confidence.
+The form has two fields: `approve` (a checkbox, off by default) and an optional `note`.
+
+- **Accept with approve ticked**: Gulliver records the approval with `channel: "elicitation"` (and the client's
+  self-reported name), then runs. Every other gate still applies. The receipt says
+  "Approved by a human in the MCP client (elicitation, client `my-client`)".
+- **Decline, cancel, or accept without ticking approve**: the answer is `needs_approval` as before, with
+  `approval_request: {"channel": "elicitation", "answer": "declined"}` saved in the receipt, and a `next_step`
+  that tells the agent not to retry the same SQL. `gulliver approve <id>` still works.
+- **The client cannot show forms** (it did not declare the elicitation capability): `needs_approval`, with
+  `approval_request.answer: "not asked"` and the reason.
+- **The cost went up between the question and the run**: nothing is approved (`answer: "stale"`).
+
+```json
+{
+  "status": "ok",
+  "approval": {
+    "receipt_id": "gv-20261102-181951-run-f501", "sql_hash": "bdd676276a901c63", "connection": "local",
+    "approved_at": "2026-11-02T18:19:51+00:00", "expires_at": "2026-11-03T18:19:51+00:00",
+    "max_cost_usd": 3.84, "note": "ok for Q3 report", "channel": "elicitation", "client": "my-client"
+  },
+  "next_step": "Done. Show the human the receipt (gulliver_receipt) if they want proof."
+}
+```
+
+The human is only asked about runs that their approval would unblock: a run that is blocked, needs a rehearsal
+first, is over the per-query or daily limit, or is cheap enough to run anyway never shows a form.
+
+### Resources
+
+Read-only context a client can attach without a tool call (metadata only, no table data is read):
+
+| URI | content |
+|---|---|
+| `gulliver://status` | connections, budget, money spent today (JSON, same as `gulliver_status`) |
+| `gulliver://rules` | the loop, status values, hard rules, lint rules and this server's budget (markdown) |
+| `gulliver://connections/{connection}/tables` | the biggest tables: rows, bytes, partitions (JSON) |
+| `gulliver://connections/{connection}/tables/{table}` | one table's columns and partitioning (JSON) |
+| `gulliver://receipts/{receipt_id}` | a receipt as markdown; `latest` for the newest |
+
+### Prompts
+
+| prompt | arguments | what it starts |
+|---|---|---|
+| `safe-query-loop` | `question`, `connection` | inspect, preflight (with autofix), rehearse, run, receipt |
+| `refactor-and-prove` | `sql`, `key`, `goal`, `connection` | `gulliver_fix`, preflight before vs after, `gulliver_diff` |
+| `make-incremental` | `sql`, `time_column`, `unique_key`, `connection` | `gulliver_incremental`, then `gulliver_diff` |
+
+A server started with a smaller tool set only offers the prompts whose tools it has.
+
+### Progress
+
+`gulliver_rehearse` sends one MCP progress notification per finished sample (`1 of 3`, `2 of 3`, `3 of 3`,
+with a message like `1% sample: 4,021 rows in 0.03s`) when the client asks for progress.
+
+### Smaller tool sets
+
+```bash
+gulliver-mcp --toolset core                  # status, inspect, lint, fix, preflight, rehearse, run, receipt
+gulliver-mcp --toolset pipeline              # status, inspect, receipt + impact, drift, diff, translate, incremental, check
+gulliver-mcp --toolset core,gulliver_check   # mix sets and tool names
+gulliver mcp --toolset core                  # same through the main CLI
+gulliver tools --format openai --toolset core
+```
+
+Sizes measured with mcp 2.3.0 (`tools/list` JSON): all 14 tools 19.8 KB, `core` 9.5 KB, `pipeline` 13.0 KB.
+Input schemas only (`gulliver tools`): 13.9 KB, 6.2 KB and 9.3 KB.
+
+### Typed output
+
+Every tool now publishes an `outputSchema` in which `status` is an enum of the eight status values and `status`
+and `next_step` are required; all other fields are allowed. `structuredContent` and the JSON text block carry
+the same object, so clients that only read text see no change. mcp 2.x already sent `structuredContent` with an
+open schema before; the typed schema adds about 200 bytes per tool.
+
+`gulliver_run` is marked `destructiveHint: true` when any connection in `gulliver.toml` has `allow_write = true`.
+
+### Guarantees
+
+- Off by default. Only a human can turn approval in the client on, in `gulliver.toml`.
+- The agent cannot approve: the form is a server-to-client request answered by the client, and the two
+  parameters that carry it are filled by the server, never by tool arguments (forged arguments are ignored; this
+  is tested).
+- An approval is bound to the exact SQL fingerprint and connection and holds 24 hours, like `gulliver approve`.
+- Every gate in `gulliver_run` still runs after the approval (limits, rehearsal, writes).
+- Works on both MCP protocol styles in mcp 2.x: a mid-call request (2025-11-25 and older) and the
+  `input_required` round trip (2026-07-28). Tested in-memory on both, and over a real stdio subprocess.
+
+### Limits
+
+- Some clients may answer forms automatically, or let the model answer them. Turn this on only for clients that
+  show elicitation forms to a person. The client name in the receipt is self-reported, not a proof of identity.
+- Needs mcp >= 2. With mcp 1.x the server falls back to `needs_approval` (the CLI channel), untested there.
+- With the channel on, each `gulliver_run` does one extra dry estimate before the run (no data read); on the
+  2026-07-28 round trip it is two.
+- Progress is best effort: a ladder that stops early ends before `3 of 3`. Cancelling a rehearsal does not yet stop
+  the engine job.
+- URL-mode elicitation is not used.
+
+## CHANGELOG
+
+- MCP-native upgrades: opt-in approval in the MCP client through elicitation (`[approval] channel = "elicitation"`,
+  recorded in the receipt with its channel; falls back to `needs_approval`), resources (`gulliver://status`,
+  `gulliver://rules`, tables, receipts), prompts (`safe-query-loop`, `refactor-and-prove`, `make-incremental`),
+  progress notifications per rehearsal sample, `gulliver-mcp --toolset core|pipeline|all` (core halves the schema),
+  a typed `outputSchema` (status enum + next_step) and `destructiveHint` on `gulliver_run` when writes are enabled.
+  `gulliver receipt latest` now picks the newest receipt within the same second correctly.
+
+## AGENTS
+
+| MCP resource / prompt | CLI | Use it to |
+|---|---|---|
+| `gulliver://rules`, `gulliver://status`, `gulliver://connections/{c}/tables[/{t}]`, `gulliver://receipts/{id}`; prompts `safe-query-loop`, `refactor-and-prove`, `make-incremental` | `gulliver-mcp --toolset core\|pipeline\|all` | read the loop, budget and table metadata without a tool call; start the loop from a prompt; load fewer tools. If `gulliver_run` returns `approval_request` with `answer: declined`, the human said no in the client: do not retry the same SQL |

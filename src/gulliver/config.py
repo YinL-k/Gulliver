@@ -120,6 +120,7 @@ class Settings:
     default_connection: str
     budget: Budget
     state_dir: Path
+    approval_channel: str = "cli"   # [approval] channel: "cli" (default) or "elicitation" (MCP client asks the human)
 
     def connection(self, name: str | None = None) -> Connection:
         key = name or self.default_connection
@@ -231,4 +232,19 @@ def load_settings(
     budget = Budget.from_mapping(budget_data)
 
     state_dir = Path(os.environ.get("GULLIVER_HOME") or data.get("state_dir") or (Path.cwd() / ".gulliver"))
-    return Settings(connections=connections, default_connection=default, budget=budget, state_dir=state_dir)
+    return Settings(connections=connections, default_connection=default, budget=budget, state_dir=state_dir,
+                    approval_channel=_approval_channel(data.get("approval") or {}))
+
+
+APPROVAL_CHANNELS = ("cli", "elicitation")
+
+
+def _approval_channel(data: dict[str, Any]) -> str:
+    """[approval] in gulliver.toml only (a human setting, no environment variable on purpose)."""
+    unknown = set(data) - {"channel"}
+    if unknown:
+        raise ConfigError(f"Unknown approval keys: {', '.join(sorted(unknown))}")
+    channel = str(data.get("channel", "cli")).lower()
+    if channel not in APPROVAL_CHANNELS:
+        raise ConfigError(f"[approval] channel must be one of {', '.join(APPROVAL_CHANNELS)}, not {channel!r}")
+    return channel

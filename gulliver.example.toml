@@ -44,3 +44,7 @@ max_bytes = 536870912000      # 500 GiB: hard stop on estimated scan
 max_runtime_s = 900
 day_usd = 10.00               # total per calendar day (UTC), from the local ledger
 max_output_rows = 200         # rows handed back to the agent as a preview
+
+[approval]
+channel = "cli"               # cli: a human runs `gulliver approve <receipt_id>`
+                              # elicitation: the MCP client asks its user (falls back to cli if it cannot)

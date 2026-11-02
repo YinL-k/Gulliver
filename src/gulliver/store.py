@@ -3,7 +3,8 @@
 Everything is plain JSON so people (and other tools) can read it.
   receipts/<id>.json    one per preflight, rehearsal and run
   ledger.jsonl          money and bytes actually spent, one line per execution
-  approvals/<id>.json   written only by `gulliver approve <id>` (a human action)
+  approvals/<id>.json   written by `gulliver approve <id>`, or by the MCP server when the human approves in
+                        the client (only with [approval] channel = "elicitation")
   audit.jsonl           hash chain over receipt and approval files (see audit.py, `gulliver audit verify`)
 """
 
@@ -30,6 +31,13 @@ def iso(dt: datetime) -> str:
 
 def parse_iso(text: str) -> datetime:
     return datetime.fromisoformat(text)
+
+
+def _mtime(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
 
 
 class Store:
@@ -89,7 +97,9 @@ class Store:
         if not self.receipts_dir.is_dir():
             return []
         out = []
-        for path in sorted(self.receipts_dir.glob("*.json"), reverse=True):
+        # newest first; ids only have one-second resolution, so ties are broken by the file's write time
+        paths = sorted(self.receipts_dir.glob("*.json"), key=lambda p: (p.name[:18], _mtime(p), p.name), reverse=True)
+        for path in paths:
             try:
                 out.append(json.loads(path.read_text()))
             except (OSError, json.JSONDecodeError):
@@ -106,7 +116,8 @@ class Store:
         return None
 
     # -- approvals -----------------------------------------------------------------
-    def approve(self, receipt_id: str, note: str = "") -> dict[str, Any]:
+    def approve(self, receipt_id: str, note: str = "", channel: str = "cli",
+                client: str | None = None) -> dict[str, Any]:
         receipt = self.load_receipt(receipt_id)
         if receipt is None:
             raise FileNotFoundError(f"No receipt {receipt_id}")
@@ -119,7 +130,10 @@ class Store:
             "expires_at": iso(now_utc() + APPROVAL_TTL),
             "max_cost_usd": receipt.get("gate", {}).get("cost_for_gate_usd"),
             "note": note,
+            "channel": channel,   # cli: `gulliver approve`; elicitation: the human answered in the MCP client
         }
+        if client:
+            approval["client"] = client
         text = json.dumps(approval, indent=2)
         (self.approvals_dir / f"{Path(receipt_id).name}.json").write_text(text)
         self._audit("approval", Path(receipt_id).name, text)

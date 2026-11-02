@@ -98,8 +98,14 @@ def render_markdown(rec: dict[str, Any]) -> str:
 
     if rec.get("approval"):
         a = rec["approval"]
-        lines += ["## Approval", "", f"Approved by a human at {a.get('approved_at')} "
+        how = ("in the MCP client (elicitation" + (f", client `{a['client']}`" if a.get("client") else "") + ")"
+               if a.get("channel") == "elicitation" else "with `gulliver approve`")
+        lines += ["## Approval", "", f"Approved by a human {how} at {a.get('approved_at')} "
                   f"(receipt `{a.get('receipt_id')}`)." + (f" Note: {a['note']}" if a.get("note") else ""), ""]
+    if rec.get("approval_request"):
+        r = rec["approval_request"]
+        lines += ["## Approval request", "", f"Asked the human in the MCP client: **{r.get('answer')}**."
+                  + (f" {r['reason']}" if r.get("reason") else ""), ""]
 
     actual = rec.get("actual")
     if actual:

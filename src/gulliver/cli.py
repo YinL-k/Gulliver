@@ -333,11 +333,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("tools", help="Print tool definitions for MCP, OpenAI or Gemini function calling")
     p.add_argument("--format", choices=["mcp", "openai", "gemini"], default="mcp")
+    p.add_argument("--toolset", default="all", help="all, core, pipeline, or a comma list of those and tool names")
 
     p = sub.add_parser("mcp", help="Start the MCP server (same as gulliver-mcp)")
     p.add_argument("--http", action="store_true")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--toolset", default="all", help="all, core, pipeline, or a comma list of those and tool names")
     return parser
 
 
@@ -359,7 +361,7 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         if args.command == "tools":
             from .mcp_server import export_tools
 
-            print(json.dumps(export_tools(args.format), indent=2))
+            print(json.dumps(export_tools(args.format, args.toolset), indent=2))
             return 0
         if args.command == "mcp":
             from .mcp_server import main as mcp_main
@@ -371,6 +373,7 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                 forwarded += ["--dsn", args.dsn]
             if args.http:
                 forwarded += ["--http", "--host", args.host, "--port", str(args.port)]
+            forwarded += ["--toolset", args.toolset]
             mcp_main(forwarded)
             return 0
         if args.command == "rules":
