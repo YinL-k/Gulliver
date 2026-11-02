@@ -115,6 +115,18 @@ def render_markdown(rec: dict[str, Any]) -> str:
                 lines.append(f"| {key} | {c['predicted']} | {c['actual']} | {c['ratio']} |")
             lines.append("")
 
+    if rec.get("sensitive_columns") or rec.get("data_warnings") or rec.get("truncated_by"):
+        lines += ["## Result guard", ""]
+        for c in rec.get("sensitive_columns") or []:
+            lines.append(f"- `{c['column']}`: {c['kind']} ({c['category']}), found by {c['detected_by']}, "
+                         f"policy **{c['action']}**")
+        lines += [f"- Warning: {w}" for w in rec.get("data_warnings") or []]
+        if rec.get("truncated_by"):
+            lines.append(f"- Preview cut by {rec['truncated_by']}")
+        if "preview" in rec:
+            lines += ["", "The preview in this receipt was stored after masking."]
+        lines.append("")
+
     if rec.get("checks"):
         lines += ["## Data quality checks", "", "| Check | Column | Result | Detail |", "|---|---|---|---|"]
         for c in rec["checks"]:

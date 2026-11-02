@@ -31,6 +31,7 @@ RULES = {
     "GV011": "window-without-partition",
     "GV012": "not-in-subquery",
     "GV013": "leading-wildcard-like",
+    "GV014": "sensitive-column-in-output",
     "GV015": "fan-trap",
 }
 
@@ -277,6 +278,12 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
                 f"each {one} row repeats once per matching {many} row, so the total can be multiplied (fan trap).",
                 f"Aggregate {many} per key in a subquery before the join, or compute the {one} total separately.",
                 agg)
+
+    # GV014 sensitive-column-in-output (column names, lineage, default policy; preflight adds the connection policy)
+    from .guard import lint_findings
+
+    for severity, message, fix in lint_findings(tree, dialect, table_info):
+        add("GV014", severity, message, fix)
 
     findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.rule))
     return findings

@@ -54,6 +54,11 @@ RULE_DOCS: dict[str, tuple[str, str, str, str]] = {
     "GV013": ("info", "LIKE / ILIKE with a leading wildcard ('%x') cannot use an index or min/max statistics, so it "
                       "scans every value.",
               "Filter on another (partition or indexed) column first, or use full-text / n-gram search.", "none"),
+    "GV014": ("info", "An output column is personal data or a secret (by name, through aliases/CTEs/SELECT *, or "
+                      "by earlier value tags). info for personal data or a masked secret, warn for a secret that "
+                      "would reach the output unmasked.",
+              "Leave the column out, aggregate it, or set a mask/hash/last4/deny action in "
+              "[connections.X.policy].", "none"),
     "GV015": ("warn", "SUM/AVG/COUNT of a column from the one side of a join `one.id = many.x_id`: each one-side row "
                       "repeats per matching row, so the total is multiplied (fan trap). Only this naming pattern, "
                       "and only when the many side is a plain table.",
