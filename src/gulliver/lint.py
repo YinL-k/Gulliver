@@ -8,7 +8,8 @@ Every rule has a stable id (GV001...), a severity and a concrete fix.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from sqlglot import exp
 
@@ -30,6 +31,7 @@ RULES = {
     "GV011": "window-without-partition",
     "GV012": "not-in-subquery",
     "GV013": "leading-wildcard-like",
+    "GV015": "fan-trap",
 }
 
 
@@ -39,13 +41,15 @@ class Finding:
     severity: str
     message: str
     fix: str
+    node: Any = field(default=None, repr=False, compare=False)  # where it was found (for line/column); not output
 
     @property
     def name(self) -> str:
         return RULES.get(self.rule, self.rule)
 
     def as_dict(self) -> dict:
-        return {"rule": self.rule, "name": self.name, **{k: v for k, v in asdict(self).items() if k != "rule"}}
+        return {"rule": self.rule, "name": self.name, "severity": self.severity, "message": self.message,
+                "fix": self.fix}
 
 
 AGG_TYPES = (exp.AggFunc,)
@@ -90,21 +94,22 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
     findings: list[Finding] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(rule: str, severity: str, message: str, fix: str) -> None:
+    def add(rule: str, severity: str, message: str, fix: str, node: exp.Expression | None = None) -> None:
         key = (rule, message)
         if key not in seen:
             seen.add(key)
-            findings.append(Finding(rule, severity, message, fix))
+            findings.append(Finding(rule, severity, message, fix, node))
 
     outer = _outer_select(tree)
 
     # GV001 select-star (only where it reaches the output or a scan; COUNT(*) is fine)
     for select in tree.find_all(exp.Select):
-        if any(_is_star_projection(p) for p in select.expressions):
+        stars = [p for p in select.expressions if _is_star_projection(p)]
+        if stars:
             add("GV001", "warn",
                 "SELECT * reads every column. Columnar engines (BigQuery, Snowflake, DuckDB on Parquet) "
                 "charge and work per column.",
-                "List only the columns you need.")
+                "List only the columns you need.", stars[0])
             break
 
     # GV002 unbounded-output and GV006 order-without-limit on the outermost query
@@ -113,18 +118,18 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
         if not has_limit and not _has_aggregation(outer):
             add("GV002", "warn",
                 "The result has no LIMIT and no aggregation, so it can return every row.",
-                "Add a LIMIT for exploration, or aggregate (GROUP BY / COUNT) before returning rows.")
+                "Add a LIMIT for exploration, or aggregate (GROUP BY / COUNT) before returning rows.", outer)
         if outer.args.get("order") and not has_limit:
             add("GV006", "warn",
                 "ORDER BY without LIMIT sorts the whole result.",
-                "Add a LIMIT, or drop the ORDER BY if the order does not matter.")
+                "Add a LIMIT, or drop the ORDER BY if the order does not matter.", outer.args["order"])
     for select in tree.find_all(exp.Select):
         if select is outer:
             continue
         if select.args.get("order") and not select.args.get("limit") and not select.find_ancestor(exp.Window):
             add("GV006", "info",
                 "ORDER BY inside a subquery without LIMIT is usually ignored but may still cost a sort.",
-                "Remove the inner ORDER BY.")
+                "Remove the inner ORDER BY.", select.args["order"])
 
     # GV003 cartesian-join / GV008 non-equi-join
     for select in tree.find_all(exp.Select):
@@ -142,7 +147,7 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
             if kind == "CROSS":
                 add("GV003", "warn",
                     f"CROSS JOIN with {alias or 'a table'} multiplies row counts (rows A x rows B).",
-                    "Make sure one side is tiny, or join on a key instead.")
+                    "Make sure one side is tiny, or join on a key instead.", join)
                 continue
             if condition is None:
                 joined_in_where = where is not None and alias in where_aliases and any(
@@ -151,11 +156,12 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
                 if joined_in_where:
                     add("GV003", "info",
                         f"Comma join with {alias} relies on the WHERE clause for its join key.",
-                        "Write it as an explicit JOIN ... ON so a missing key cannot slip in.")
+                        "Write it as an explicit JOIN ... ON so a missing key cannot slip in.", join)
                 else:
                     add("GV003", "error",
                         f"Join with {alias or 'a table'} has no join condition: a cartesian product.",
-                        "Add ON <key> = <key> (or USING). If you really want every combination, write CROSS JOIN.")
+                        "Add ON <key> = <key> (or USING). If you really want every combination, write CROSS JOIN.",
+                        join)
                 continue
             if join.args.get("on") is not None:
                 on = join.args["on"]
@@ -165,7 +171,7 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
                     add("GV008", "warn",
                         f"Join with {alias} uses a non-equality or OR condition; these joins can explode "
                         "and cannot use hash joins.",
-                        "Join on equality keys where possible; split OR conditions into UNION ALL.")
+                        "Join on equality keys where possible; split OR conditions into UNION ALL.", join)
 
     # GV004 missing-partition-filter (needs engine metadata)
     if table_info:
@@ -185,7 +191,7 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
                 add("GV004", "error",
                     f"{table_ref(table, dialect)} is partitioned by {', '.join(part_cols)} but the query does not "
                     "filter on it, so every partition is scanned.",
-                    f"Add a WHERE filter on {part_cols[0]} (for example a date range).")
+                    f"Add a WHERE filter on {part_cols[0]} (for example a date range).", table)
 
     # GV005 function-on-filter-column
     for select in tree.find_all(exp.Select):
@@ -204,7 +210,7 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
                             f"The filter wraps {cols[0].sql(dialect=dialect)} in a function or calculation, which "
                             "blocks partition pruning and min/max skipping.",
                             "Compare the raw column to a constant range, e.g. ts >= '2024-01-01' AND "
-                            "ts < '2024-01-02' instead of DATE(ts) = '2024-01-01'.")
+                            "ts < '2024-01-02' instead of DATE(ts) = '2024-01-01'.", cmp)
                         break
 
     # GV007 exact-count-distinct
@@ -212,7 +218,7 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
         if isinstance(count.this, exp.Distinct):
             add("GV007", "info",
                 "COUNT(DISTINCT ...) is exact and memory-heavy on big data.",
-                "If an estimate is fine, use APPROX_COUNT_DISTINCT (or the engine's HLL function).")
+                "If an estimate is fine, use APPROX_COUNT_DISTINCT (or the engine's HLL function).", count)
             break
 
     # GV009 union-distinct
@@ -220,7 +226,7 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
         if union.args.get("distinct"):
             add("GV009", "info",
                 "UNION removes duplicates, which needs a full sort or hash of both sides.",
-                "Use UNION ALL if duplicates are impossible or acceptable.")
+                "Use UNION ALL if duplicates are impossible or acceptable.", union)
             break
 
     # GV010 scalar subquery in the SELECT list
@@ -229,7 +235,7 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
             if any(isinstance(n, exp.Subquery) for n in projection.walk()):
                 add("GV010", "info",
                     "A subquery in the SELECT list can run once per row on some engines.",
-                    "Rewrite it as a JOIN on a pre-aggregated subquery.")
+                    "Rewrite it as a JOIN on a pre-aggregated subquery.", projection)
                 break
 
     # GV011 window-without-partition
@@ -238,7 +244,7 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
             add("GV011", "warn",
                 "A window function with ORDER BY but no PARTITION BY puts every row in one partition "
                 "(one worker, one big sort).",
-                "Add PARTITION BY a key, or compute it on a smaller result.")
+                "Add PARTITION BY a key, or compute it on a smaller result.", window)
             break
 
     # GV012 NOT IN (subquery)
@@ -247,7 +253,7 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
         if isinstance(inner, exp.In) and inner.args.get("query") is not None:
             add("GV012", "info",
                 "NOT IN (subquery) returns nothing if the subquery has a NULL, and often plans badly.",
-                "Use NOT EXISTS or a LEFT JOIN ... WHERE key IS NULL.")
+                "Use NOT EXISTS or a LEFT JOIN ... WHERE key IS NULL.", not_node)
             break
 
     # GV013 LIKE / ILIKE with a leading wildcard
@@ -258,11 +264,67 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
                 f"{like.sql(dialect=dialect)} starts with a wildcard, so no index or min/max statistics can help: "
                 "it scans every value.",
                 "Filter on another (partition or indexed) column first, or use the engine's full-text / "
-                "n-gram search.")
+                "n-gram search.", like)
             break
+
+    # GV015 fan-trap (kept narrow on purpose: only the `one.id = many.x_id` naming pattern counts)
+    for select in tree.find_all(exp.Select):
+        trap = _fan_trap(select, tree)
+        if trap is not None:
+            agg, one, many, cond = trap
+            add("GV015", "warn",
+                f"{agg.sql(dialect=dialect)} adds up a column of {one} after the join {cond.sql(dialect=dialect)}: "
+                f"each {one} row repeats once per matching {many} row, so the total can be multiplied (fan trap).",
+                f"Aggregate {many} per key in a subquery before the join, or compute the {one} total separately.",
+                agg)
 
     findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.rule))
     return findings
+
+
+def _fan_trap(select: exp.Select, tree: exp.Expression) -> tuple[exp.Expression, str, str, exp.EQ] | None:
+    """SUM/AVG/COUNT of a column from the 'one' side of `one.id = many.<x>_id`, in an aggregating SELECT.
+
+    The many side must be a base table (a subquery or CTE may already be aggregated per key), and the query
+    must not group by the many side's own id (then each group has one many row)."""
+    if not _has_aggregation(select):
+        return None
+    cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    sources: dict[str, exp.Expression] = {}
+    from_ = select.args.get("from_") or select.args.get("from")
+    for item in ([from_.this] if from_ is not None else []) + [j.this for j in select.args.get("joins") or []]:
+        sources[(item.alias_or_name or "").lower()] = item
+    group_cols = {(c.table.lower(), c.name.lower()) for c in (select.args.get("group") or exp.Group()).find_all(exp.Column)}
+    for join in select.args.get("joins") or []:
+        cond = join.args.get("on")
+        if not (isinstance(cond, exp.EQ) and isinstance(cond.this, exp.Column)
+                and isinstance(cond.expression, exp.Column)):
+            continue
+        left, right = cond.this, cond.expression
+        if not (left.table and right.table) or left.table.lower() == right.table.lower():
+            continue
+        sides = [(left.table.lower(), left.name.lower()), (right.table.lower(), right.name.lower())]
+        ones = [s for s in sides if s[1] == "id"]
+        manys = [s for s in sides if s[1] != "id" and s[1].endswith("_id")]
+        if len(ones) != 1 or len(manys) != 1:
+            continue
+        one, many = ones[0][0], manys[0][0]
+        many_src = sources.get(many)
+        if not (isinstance(many_src, exp.Table) and isinstance(many_src.this, exp.Identifier)) or (
+                many_src.name.lower() in cte_names and not many_src.args.get("db")):
+            continue
+        if one not in sources or (many, "id") in group_cols:
+            continue
+        for projection in select.expressions:
+            for agg in projection.find_all(exp.Sum, exp.Avg, exp.Count):
+                if agg.find_ancestor(exp.Window) or agg.find_ancestor(exp.Select) is not select:
+                    continue
+                if isinstance(agg.this, exp.Distinct):
+                    continue
+                cols = list(agg.find_all(exp.Column))
+                if cols and all(c.table and c.table.lower() == one for c in cols):
+                    return agg, one, many, cond
+    return None
 
 
 def summarize(findings: list[Finding]) -> dict[str, int]:
