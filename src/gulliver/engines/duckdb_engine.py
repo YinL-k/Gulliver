@@ -136,6 +136,32 @@ class DuckDBEngine(Engine):
         info.name = ref
         return info
 
+    def view_sources(self, ref: str) -> list[str] | None:
+        """The tables a view reads (from its definition), or None when ref is not a view."""
+        try:
+            node = sqlglot.parse_one(f"SELECT * FROM {ref}", read="duckdb").find(exp.Table)
+        except sqlglot.errors.ParseError:
+            return None
+        if node is None or not isinstance(node.this, exp.Identifier):
+            return None
+        query = "SELECT sql FROM duckdb_views() WHERE NOT internal AND lower(view_name) = lower(?)"
+        params: list[Any] = [node.name]
+        if node.db:
+            query += " AND lower(schema_name) = lower(?)"
+            params.append(node.db)
+        row = self.con.execute(query + " LIMIT 1", params).fetchone()
+        if row is None or not row[0]:
+            return None
+        from ..sqlsafety import classify
+
+        try:
+            body = sqlglot.parse_one(str(row[0]), read="duckdb").expression
+        except sqlglot.errors.ParseError:
+            return None
+        if body is None:
+            return None
+        return list(classify(body.sql(dialect="duckdb"), "duckdb").tables)
+
     def _file_info(self, node: exp.Table, ref: str) -> TableInfo | None:
         func = node.this
         args = [a for a in func.iter_expressions() if isinstance(a, exp.Literal) and a.is_string]

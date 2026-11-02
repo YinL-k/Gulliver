@@ -196,8 +196,8 @@ def build_server(toolset: str | None = None) -> Any:
         allow_write: Annotated[bool, Field(description="Needed for CREATE/INSERT ... SELECT; the connection must "
                                                        "also allow writes.")] = False,
         ctx: native.Context = None,
-        probe: native.Probe = None,  # filled by the server (approval in the client), not an agent argument
-        answer: native.Answer = None,  # the human's answer to the approval form, not an agent argument
+        probe: native.Probe = native.SERVER_FILLED,  # filled by the server (approval in the client), not an agent argument
+        answer: native.Answer = native.SERVER_FILLED,  # the human's answer to the approval form, not an agent argument
     ) -> ToolResult:
         return await native.run_tool(_guard, ctx, sql=sql, connection=connection, max_rows=max_rows,
                                      allow_write=allow_write, probe=probe, answer=answer)

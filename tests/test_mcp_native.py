@@ -498,3 +498,25 @@ def test_stdio_elicitation_and_progress(demo_db, state, tmp_path):
     assert len(asked) == 1, run
     assert run["status"] == "ok" and run["approval"]["channel"] == "elicitation"
     assert reh["status"] in ("ok", "warn") and progress == [1, 2, 3]
+
+
+def test_server_filled_parameters_have_no_none_default():
+    """On Python 3.10, typing.get_type_hints wraps the annotation of a parameter whose default is None in
+    Optional[...]; mcp then refuses `Annotated[..., Resolve(...)]` as a union and the server cannot start. Check
+    the cause on every Python version, not only on 3.10."""
+    import inspect
+    import typing
+
+    from mcp.server.mcpserver.resolve import Resolve
+
+    checked = 0
+    for tool in build_server()._tool_manager._tools.values():
+        hints = typing.get_type_hints(tool.fn, include_extras=True)
+        for name, param in inspect.signature(tool.fn).parameters.items():
+            ann = hints.get(name)
+            if typing.get_origin(ann) is typing.Union:  # Python 3.10 already wrapped it: that is the bug
+                ann = next((a for a in typing.get_args(ann) if typing.get_origin(a) is typing.Annotated), ann)
+            if typing.get_origin(ann) is typing.Annotated and any(isinstance(m, Resolve) for m in ann.__metadata__):
+                checked += 1
+                assert param.default is not None, f"{tool.name}.{name} has a None default (breaks Python 3.10)"
+    assert checked >= 2  # gulliver_run's probe and answer

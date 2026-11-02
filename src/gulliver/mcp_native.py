@@ -378,6 +378,22 @@ else:  # pragma: no cover - mcp 1.x
     Answer = SkipJsonSchema[None]  # type: ignore[misc]
 
 
+class _ServerFilled:
+    """Default of the server-filled gulliver_run parameters with mcp 2.x. Not None: on Python 3.10,
+    typing.get_type_hints wraps the annotation of a parameter whose default is None in Optional[...], and mcp then
+    refuses the `Annotated[..., Resolve(...)]` as "wraps Resolve(...) in a union". mcp always fills the value."""
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "<filled by the server>"
+
+
+# The default for Probe / Answer parameters: None with mcp 1.x (SkipJsonSchema needs it), a sentinel with 2.x.
+SERVER_FILLED: Any = _ServerFilled() if HAS_ELICITATION else None
+
+
 def _unwrap_answer(answer: Any) -> Any:
     """ask_resolver may return the outcome itself (mid-call request); the framework then wraps it as accepted."""
     if isinstance(answer, AcceptedElicitation) and not isinstance(answer.data, ApprovalForm):
@@ -438,6 +454,9 @@ def run_with_approval(settings: Any, sql: str, connection: str | None = None, ma
 async def run_tool(guard: Any, ctx: Any, **kwargs: Any) -> dict[str, Any]:
     import anyio
 
+    for key in ("probe", "answer"):  # a sentinel default that mcp did not fill means "nothing to ask"
+        if isinstance(kwargs.get(key), _ServerFilled):
+            kwargs[key] = None
     client = client_name(ctx) if kwargs.get("probe") else None
     return await anyio.to_thread.run_sync(functools.partial(guard, run_with_approval, client=client, **kwargs))
 

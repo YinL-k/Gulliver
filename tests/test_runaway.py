@@ -621,6 +621,21 @@ def test_free_queries_without_a_byte_estimate_are_cheap_repeats(settings):
         assert "cheap" in results[-1]["runaway"]["note"]
 
 
+def test_free_queries_on_a_view_are_cheap_repeats(tmp_path, state):
+    """A view has no size in duckdb_tables(): it counts as the tables it reads (also through a view and a CTE)."""
+    path = tmp_path / "views.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute("create table events as select i as id from range(5000) t(i)")
+    con.execute("create view v_events as select * from events")
+    con.execute("create view v_nested as with x as (select * from v_events) select * from x")
+    con.close()
+    s = load_settings(dsn=str(path), budget_overrides={"max_repeats": 2})
+    for sql in ("select count(*) as n from v_events", "select count(*) as n from v_nested"):
+        results = [core.run(s, sql) for _ in range(4)]
+        assert [r["status"] for r in results] == ["ok"] * 4, results[-1]
+        assert "cheap" in results[-1]["runaway"]["note"]
+
+
 def test_velocity_counts_the_agent_across_sessions(billed, monkeypatch):
     s = billed(velocity_usd=0.7)
     with use(Identity("claude-code", session="s1")):

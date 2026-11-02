@@ -156,15 +156,25 @@ def _cached(store: Store, entry: dict[str, Any]) -> dict[str, Any] | None:
     return out
 
 
-def _metadata_bytes(engine: Engine, tables: list[str]) -> int | None:
+def _metadata_bytes(engine: Engine, tables: list[str], depth: int = 0) -> int | None:
     """The size of what the query reads when the estimate has no byte count (count(*), constants): the sum of
-    the referenced tables from metadata, 0 for a query without tables, None when a table's size is unknown."""
+    the referenced tables from metadata (a DuckDB view counts as the tables it reads), 0 for a query without
+    tables, None when a table's size is unknown."""
     total = 0
     for ref in tables:
         try:
             info = engine.table_info(ref)
+            sources = None
+            if (info is None or info.bytes is None) and depth < 5 and hasattr(engine, "view_sources"):
+                sources = engine.view_sources(ref)
         except Exception:  # metadata must never break a run
             return None
+        if sources is not None:
+            size = _metadata_bytes(engine, sources, depth + 1)
+            if size is None:
+                return None
+            total += size
+            continue
         if info is None or info.bytes is None:
             return None
         total += int(info.bytes)

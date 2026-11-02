@@ -17,7 +17,8 @@ queries of `diff`, `check` and `incremental`) just before it runs:
 
 Repeats that are cheap (under $0.01 **and** under 1 GB) are never treated as a loop, so looking at a small
 table again and again just works. When the estimate has no byte count (`count(*)`, `select 42`), the size of
-the tables it reads from metadata is used instead; a query on a view of unknown size is not cheap.
+the tables it reads from metadata is used instead (a DuckDB view counts as the tables it reads); a query on
+a table or view of unknown size (a BigQuery or Snowflake view, a remote file) is not cheap.
 A repeat is also allowed when the tables changed since the last run. "The same query" ignores case,
 whitespace, a trailing `;` and comments, so `-- retry 2` does not make it a new query.
 A human approval (`gulliver approve <receipt_id>`) for a query buys it another `max_repeats` runs and lifts
