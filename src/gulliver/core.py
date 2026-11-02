@@ -18,6 +18,7 @@ from .engines import Engine, EngineError, TableInfo, dialect_for, get_engine
 from .extrapolate import Fit, fit_power_law, overall_confidence
 from .lint import Finding, _has_aggregation, _outer_select, lint, summarize
 from .sampling import sample_query
+from .security import policy_for
 from .sqlsafety import Statement, classify
 from .store import Store
 
@@ -201,7 +202,7 @@ def _gate(settings: Settings, engine: Engine, estimate: Any, findings: list[Find
 def _preflight_core(settings: Settings, sql: str, connection: str | None) -> dict[str, Any]:
     conn = settings.connection(connection)
     dialect = dialect_for(conn.engine)
-    statement = classify(sql, dialect)
+    statement = classify(sql, dialect, policy_for(conn))
     base: dict[str, Any] = {
         "action": "preflight",
         "connection": conn.name,
@@ -212,7 +213,8 @@ def _preflight_core(settings: Settings, sql: str, connection: str | None) -> dic
     }
     if statement.kind == "block":
         base.update(status="block", gate={"status": "block", "blocks": [statement.reason]},
-                    next_step="Rewrite it as one SELECT (or CREATE/INSERT ... SELECT). " + statement.reason)
+                    next_step=statement.reason if statement.code else
+                    "Rewrite it as one SELECT (or CREATE/INSERT ... SELECT). " + statement.reason)
         return base
 
     store = _store(settings)
@@ -288,7 +290,7 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
     store = _store(settings)
     conn = settings.connection(connection)
     dialect = dialect_for(conn.engine)
-    statement = classify(sql, dialect)
+    statement = classify(sql, dialect, policy_for(conn))
     result: dict[str, Any] = {
         "action": "rehearse", "connection": conn.name, "engine": conn.engine, "sql": sql.strip(),
         "sql_hash": statement.sql_hash, "statement": statement.public(),

@@ -1,0 +1,907 @@
+# Gulliver's read-only gate: the bypass test set.
+#
+# Every case is classified by sqlsafety.classify with a fixed test policy:
+#   allowed_paths = ["/gulliver-selftest/data"], relative paths resolve there, allow_remote = false,
+#   allow_functions = [] (a case can override allow_remote and allow_functions).
+# expect is read | write | block; code is the GS code a block must carry ("" = a structural block).
+# `gulliver selftest security` runs this file; tests/test_security.py runs it in CI.
+# New bypass found? Add it here first (expect = "block"), then fix the gate.
+
+# -- ordinary SQL must stay allowed (false positives are bugs too) --------------------------------
+[[case]]
+id = "ok-everyday-duckdb"
+dialect = "duckdb"
+sql = "select date_trunc('day', ts) d, count(*), coalesce(amount, 0), regexp_matches(s, 'x'), regexp_replace(s, 'a', 'b') from events group by 1, 3, 4, 5"
+expect = "read"
+
+[[case]]
+id = "ok-parquet-glob-in-allowed-folder"
+dialect = "duckdb"
+sql = "select * from read_parquet('events/*.parquet') where ts >= '2025-01-01'"
+expect = "read"
+
+[[case]]
+id = "ok-replacement-scan-relative"
+dialect = "duckdb"
+sql = "select count(*) from 'data.csv'"
+expect = "read"
+
+[[case]]
+id = "ok-absolute-path-in-allowed-folder"
+dialect = "duckdb"
+sql = "select * from read_csv('/gulliver-selftest/data/x.csv', header = true)"
+expect = "read"
+
+[[case]]
+id = "ok-parquet-list"
+dialect = "duckdb"
+sql = "select * from read_parquet(['a.parquet', 'sub/b.parquet'])"
+expect = "read"
+
+[[case]]
+id = "ok-parquet-metadata"
+dialect = "duckdb"
+sql = "select * from parquet_metadata('x.parquet')"
+expect = "read"
+
+[[case]]
+id = "ok-column-named-query"
+dialect = "duckdb"
+sql = "select query, count(*) from history group by query"
+expect = "read"
+
+[[case]]
+id = "ok-cte-named-query"
+dialect = "duckdb"
+sql = "with query as (select 1 as a) select * from query"
+expect = "read"
+
+[[case]]
+id = "ok-quoted-table-name"
+dialect = "duckdb"
+sql = "select * from \"my table\""
+expect = "read"
+
+[[case]]
+id = "ok-range"
+dialect = "duckdb"
+sql = "select * from range(10)"
+expect = "read"
+
+[[case]]
+id = "ok-postgres-everyday"
+dialect = "postgres"
+sql = "select json_build_object('a', 1), to_char(now(), 'YYYY'), string_agg(name, ',') from users group by id"
+expect = "read"
+
+[[case]]
+id = "ok-jsonb-path-query"
+dialect = "postgres"
+sql = "select jsonb_path_query(doc, '$.a') from t"
+expect = "read"
+note = "contains the word query but runs no SQL"
+
+[[case]]
+id = "ok-current-setting"
+dialect = "postgres"
+sql = "select current_setting('search_path')"
+expect = "read"
+
+[[case]]
+id = "ok-relation-size"
+dialect = "postgres"
+sql = "select pg_size_pretty(pg_total_relation_size('t'))"
+expect = "read"
+
+[[case]]
+id = "ok-dollar-quoted-string-is-data"
+dialect = "postgres"
+sql = "select $$; drop table t; $$ as s"
+expect = "read"
+
+[[case]]
+id = "ok-function-name-in-a-string"
+dialect = "postgres"
+sql = "select 'pg_terminate_backend(1)' as s"
+expect = "read"
+
+[[case]]
+id = "ok-generate-series"
+dialect = "postgres"
+sql = "select * from generate_series(1, 10)"
+expect = "read"
+
+[[case]]
+id = "ok-pg-sleep"
+dialect = "postgres"
+sql = "select pg_sleep(0)"
+expect = "read"
+note = "not a side effect; the runtime limit covers slow queries"
+
+[[case]]
+id = "ok-bigquery-partition-filter"
+dialect = "bigquery"
+sql = "select * from `proj.ds.events` where _PARTITIONDATE = '2025-01-01'"
+expect = "read"
+
+[[case]]
+id = "ok-bigquery-functions"
+dialect = "bigquery"
+sql = "select safe_divide(a, b), approx_count_distinct(u) from `p.d.t`"
+expect = "read"
+
+[[case]]
+id = "ok-snowflake-clustering-information"
+dialect = "snowflake"
+sql = "select system$clustering_information('t')"
+expect = "read"
+
+[[case]]
+id = "ok-snowflake-result-scan"
+dialect = "snowflake"
+sql = "select * from table(result_scan(last_query_id()))"
+expect = "read"
+
+[[case]]
+id = "ok-write-with-sequence"
+dialect = "duckdb"
+sql = "insert into out select nextval('seq'), id from events"
+expect = "write"
+note = "sequences may advance in a write a human enabled"
+
+[[case]]
+id = "ok-ctas-from-parquet"
+dialect = "duckdb"
+sql = "create table out as select * from read_parquet('x.parquet')"
+expect = "write"
+
+# -- GS001 server control --------------------------------------------------------------------------
+[[case]]
+id = "gs001-terminate-backend"
+dialect = "postgres"
+sql = "select pg_terminate_backend(123)"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-schema-qualified"
+dialect = "postgres"
+sql = "select pg_catalog.pg_terminate_backend(pid) from pg_stat_activity"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-quoted-name"
+dialect = "postgres"
+sql = "select \"pg_terminate_backend\"(123)"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-unicode-escaped-name"
+dialect = "postgres"
+sql = "select U&\"pg\\005fterminate_backend\"(123)"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-comment-between-name-and-paren"
+dialect = "postgres"
+sql = "select pg_terminate_backend/**/(123)"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-line-comment-trick"
+dialect = "postgres"
+sql = "select 1 -- harmless\n, pg_terminate_backend(123)"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-upper-case"
+dialect = "postgres"
+sql = "SELECT PG_CANCEL_BACKEND(1)"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-reload-conf"
+dialect = "postgres"
+sql = "select pg_reload_conf()"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-rotate-logfile"
+dialect = "postgres"
+sql = "select pg_rotate_logfile()"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-switch-wal"
+dialect = "postgres"
+sql = "select pg_switch_wal()"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-promote"
+dialect = "postgres"
+sql = "select pg_promote()"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-restore-point"
+dialect = "postgres"
+sql = "select pg_create_restore_point('x')"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-stat-reset"
+dialect = "postgres"
+sql = "select pg_stat_reset()"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-drop-replication-slot"
+dialect = "postgres"
+sql = "select pg_drop_replication_slot('s')"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-in-scalar-subquery"
+dialect = "postgres"
+sql = "select * from t where id = (select pg_terminate_backend(1))"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-in-cte"
+dialect = "postgres"
+sql = "with x as (select pg_cancel_backend(pid) from pg_stat_activity) select count(*) from x"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-in-lateral"
+dialect = "postgres"
+sql = "select * from pg_stat_activity a, lateral (select pg_terminate_backend(a.pid)) k"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-in-insert-select"
+dialect = "postgres"
+sql = "insert into log select pg_terminate_backend(pid) from pg_stat_activity"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-snowflake-cancel-query"
+dialect = "snowflake"
+sql = "select system$cancel_query('01a2b3c4')"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-snowflake-abort-session"
+dialect = "snowflake"
+sql = "SELECT SYSTEM$ABORT_SESSION(1065153872298)"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-snowflake-abort-transaction"
+dialect = "snowflake"
+sql = "select system$abort_transaction(1)"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "gs001-snowflake-unknown-system-function"
+dialect = "snowflake"
+sql = "select system$wait(10)"
+expect = "block"
+code = "GS001"
+
+# -- GS002 session and database state ----------------------------------------------------------
+[[case]]
+id = "gs002-set-config"
+dialect = "postgres"
+sql = "select set_config('statement_timeout', '0', false)"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-advisory-lock"
+dialect = "postgres"
+sql = "select pg_advisory_lock(1)"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-try-advisory-xact-lock"
+dialect = "postgres"
+sql = "select pg_try_advisory_xact_lock(1)"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-notify"
+dialect = "postgres"
+sql = "select pg_notify('channel', 'payload')"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-nextval-in-read"
+dialect = "postgres"
+sql = "select nextval('s')"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-setval"
+dialect = "postgres"
+sql = "select setval('s', 1)"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-duckdb-nextval"
+dialect = "duckdb"
+sql = "select nextval('seq')"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-for-update"
+dialect = "postgres"
+sql = "select * from accounts where id = 1 for update"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-for-share"
+dialect = "postgres"
+sql = "select * from accounts for share"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-large-object-unlink"
+dialect = "postgres"
+sql = "select lo_unlink(123)"
+expect = "block"
+code = "GS002"
+
+[[case]]
+id = "gs002-snowflake-sequence"
+dialect = "snowflake"
+sql = "select seq1.nextval"
+expect = "block"
+code = "GS002"
+
+# -- GS003 SQL hidden in strings ---------------------------------------------------------------
+[[case]]
+id = "gs003-dblink-exec"
+dialect = "postgres"
+sql = "select dblink_exec('host=x', 'drop table t')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-dblink-table"
+dialect = "postgres"
+sql = "select * from dblink('host=x', 'select 1') as t(a int)"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-query-to-xml"
+dialect = "postgres"
+sql = "select query_to_xml('delete from t returning 1', true, false, '')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-query-to-xml-dollar-quoted"
+dialect = "postgres"
+sql = "select query_to_xml($q$delete from t returning 1$q$, true, false, '')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-cursor-to-xml"
+dialect = "postgres"
+sql = "select cursor_to_xml('c', 1, false, false, '')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-ts-stat"
+dialect = "postgres"
+sql = "select * from ts_stat('select vec from docs')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-duckdb-query"
+dialect = "duckdb"
+sql = "select * from query('drop table t')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-duckdb-query-table"
+dialect = "duckdb"
+sql = "select * from query_table('t')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-duckdb-postgres-query"
+dialect = "duckdb"
+sql = "select * from postgres_query('db', 'drop table x')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-duckdb-serialized-sql"
+dialect = "duckdb"
+sql = "select json_execute_serialized_sql('{}')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-bigquery-external-query"
+dialect = "bigquery"
+sql = "select * from external_query('us.conn', 'delete from t')"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "gs003-bigquery-external-query-upper"
+dialect = "bigquery"
+sql = "SELECT * FROM EXTERNAL_QUERY('us.conn', 'SELECT 1')"
+expect = "block"
+code = "GS003"
+
+# -- GS004 files, environment, network ---------------------------------------------------------
+[[case]]
+id = "gs004-pg-read-file"
+dialect = "postgres"
+sql = "select pg_read_file('/etc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-pg-read-binary-file"
+dialect = "postgres"
+sql = "select pg_read_binary_file('pg_hba.conf')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-pg-ls-dir"
+dialect = "postgres"
+sql = "select * from pg_ls_dir('.')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-pg-stat-file"
+dialect = "postgres"
+sql = "select pg_stat_file('postgresql.conf')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-lo-import"
+dialect = "postgres"
+sql = "select lo_import('/etc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-lo-export"
+dialect = "postgres"
+sql = "select lo_export(1, '/tmp/x')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-read-text"
+dialect = "duckdb"
+sql = "select * from read_text('/etc/hostname')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-read-blob"
+dialect = "duckdb"
+sql = "select * from read_blob('x.bin')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-getenv"
+dialect = "duckdb"
+sql = "select getenv('HOME')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-duckdb-secrets"
+dialect = "duckdb"
+sql = "select * from duckdb_secrets()"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-http-get"
+dialect = "duckdb"
+sql = "select http_get('https://example.com')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-read-csv-etc-passwd"
+dialect = "duckdb"
+sql = "select * from read_csv('/etc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-replacement-scan-absolute"
+dialect = "duckdb"
+sql = "select * from '/etc/passwd'"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-path-traversal"
+dialect = "duckdb"
+sql = "select * from read_parquet('../../secret.parquet')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-home-directory"
+dialect = "duckdb"
+sql = "select * from read_csv('~/.aws/credentials')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-dotenv-in-allowed-folder"
+dialect = "duckdb"
+sql = "select * from read_csv('.env')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-gulliver-state"
+dialect = "duckdb"
+sql = "select * from read_json('.gulliver/receipts/latest.json')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-hidden-glob"
+dialect = "duckdb"
+sql = "select * from read_csv('.e*')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-file-uri"
+dialect = "duckdb"
+sql = "select * from read_csv('file:///etc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-remote-url"
+dialect = "duckdb"
+sql = "select * from read_csv('https://example.com/x.csv')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-remote-replacement-scan"
+dialect = "duckdb"
+sql = "select * from 's3://bucket/x.parquet'"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-one-bad-path-in-list"
+dialect = "duckdb"
+sql = "select * from read_parquet(['a.parquet', '/etc/x.parquet'])"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-computed-path"
+dialect = "duckdb"
+sql = "select * from read_parquet('/et' || 'c/x.parquet')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-glob-outside"
+dialect = "duckdb"
+sql = "select * from glob('/etc/*')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-sqlite-scan-outside"
+dialect = "duckdb"
+sql = "select * from sqlite_scan('/var/lib/app.db', 'users')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-path-in-cte"
+dialect = "duckdb"
+sql = "with x as (select * from read_csv_auto('/etc/passwd')) select count(*) from x"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "gs004-ctas-from-outside"
+dialect = "duckdb"
+sql = "create table stolen as select * from read_csv('/etc/passwd')"
+expect = "block"
+code = "GS004"
+
+# -- structural blocks (statement kind) --------------------------------------------------------
+[[case]]
+id = "struct-commit-escape"
+dialect = "postgres"
+sql = "commit; drop table t"
+expect = "block"
+
+[[case]]
+id = "struct-select-then-delete"
+dialect = "postgres"
+sql = "select 1; delete from t"
+expect = "block"
+
+[[case]]
+id = "struct-cte-with-dml"
+dialect = "postgres"
+sql = "with d as (delete from t returning *) select * from d"
+expect = "block"
+
+[[case]]
+id = "struct-select-into"
+dialect = "postgres"
+sql = "select * into new_t from t"
+expect = "block"
+
+[[case]]
+id = "struct-explain-analyze-delete"
+dialect = "postgres"
+sql = "explain analyze delete from t"
+expect = "block"
+
+[[case]]
+id = "struct-do-block"
+dialect = "postgres"
+sql = "do $$ begin drop table t; end $$"
+expect = "block"
+
+[[case]]
+id = "struct-call"
+dialect = "postgres"
+sql = "call cleanup()"
+expect = "block"
+
+[[case]]
+id = "struct-duckdb-copy-to"
+dialect = "duckdb"
+sql = "copy (select 1) to '/tmp/x.csv'"
+expect = "block"
+
+[[case]]
+id = "struct-duckdb-attach"
+dialect = "duckdb"
+sql = "attach '/tmp/x.db' as x"
+expect = "block"
+
+[[case]]
+id = "struct-duckdb-install"
+dialect = "duckdb"
+sql = "install httpfs"
+expect = "block"
+
+[[case]]
+id = "struct-duckdb-set"
+dialect = "duckdb"
+sql = "set enable_external_access = true"
+expect = "block"
+
+[[case]]
+id = "struct-duckdb-pragma"
+dialect = "duckdb"
+sql = "pragma enable_profiling"
+expect = "block"
+
+[[case]]
+id = "struct-snowflake-execute-immediate"
+dialect = "snowflake"
+sql = "execute immediate 'drop table t'"
+expect = "block"
+
+[[case]]
+id = "struct-bigquery-execute-immediate"
+dialect = "bigquery"
+sql = "execute immediate \"drop table t\""
+expect = "block"
+
+# -- what the human allows on the connection ---------------------------------------------------
+[[case]]
+id = "allow-function-read-text"
+dialect = "duckdb"
+sql = "select * from read_text('notes.txt')"
+allow_functions = ["read_text"]
+expect = "read"
+
+[[case]]
+id = "allow-function-nextval"
+dialect = "postgres"
+sql = "select nextval('s')"
+allow_functions = ["nextval"]
+expect = "read"
+
+[[case]]
+id = "allow-function-does-not-lift-path-check"
+dialect = "duckdb"
+sql = "select * from read_text('/etc/hostname')"
+allow_functions = ["read_text"]
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "allow-remote-true"
+dialect = "duckdb"
+sql = "select * from read_csv('https://example.com/x.csv')"
+allow_remote = true
+expect = "read"
+
+[[case]]
+id = "allow-remote-prefix"
+dialect = "duckdb"
+sql = "select * from read_parquet('s3://my-bucket/x.parquet')"
+allow_remote = ["s3://my-bucket/"]
+expect = "read"
+
+[[case]]
+id = "allow-remote-other-prefix"
+dialect = "duckdb"
+sql = "select * from read_parquet('s3://other-bucket/x.parquet')"
+allow_remote = ["s3://my-bucket/"]
+expect = "block"
+code = "GS004"
+
+# -- more hiding places --------------------------------------------------------------------------
+[[case]]
+id = "hide-rows-from"
+dialect = "postgres"
+sql = "select * from rows from (pg_ls_dir('.'))"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-composite-expansion"
+dialect = "postgres"
+sql = "select (pg_ls_dir('.')).*"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-in-where"
+dialect = "postgres"
+sql = "select * from t where pg_read_file('x') is not null"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-in-in-subquery"
+dialect = "postgres"
+sql = "select * from t where x in (select dblink_exec('a', 'b'))"
+expect = "block"
+code = "GS003"
+
+[[case]]
+id = "hide-snowflake-quoted-system-function"
+dialect = "snowflake"
+sql = "select \"SYSTEM$CANCEL_QUERY\"(1)"
+expect = "block"
+code = "GS001"
+
+[[case]]
+id = "hide-duckdb-from-first"
+dialect = "duckdb"
+sql = "from read_csv('/etc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-duckdb-double-quoted-path"
+dialect = "duckdb"
+sql = "select * from \"/etc/passwd\""
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-duckdb-nested-from-first"
+dialect = "duckdb"
+sql = "select * from (from '/etc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-duckdb-dot-call"
+dialect = "duckdb"
+sql = "select 'HOME'.getenv()"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-duckdb-lambda"
+dialect = "duckdb"
+sql = "select list_transform([1], x -> getenv('A'))"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-duckdb-second-union-branch"
+dialect = "duckdb"
+sql = "select * from read_csv('data/x.csv') union all select * from read_csv('/etc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-duckdb-escape-string-path"
+dialect = "duckdb"
+sql = "select * from read_csv(E'\\x2fetc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-duckdb-cast-path"
+dialect = "duckdb"
+sql = "select * from read_csv('/etc/passwd'::varchar)"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-duckdb-double-slash"
+dialect = "duckdb"
+sql = "select * from read_csv('//etc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "hide-duckdb-implicit-join"
+dialect = "duckdb"
+sql = "select * from events, read_csv('/etc/passwd')"
+expect = "block"
+code = "GS004"
+
+[[case]]
+id = "ok-postgres-column-named-nextval"
+dialect = "postgres"
+sql = "select t.nextval from t"
+expect = "read"
+note = "only Snowflake's seq.NEXTVAL advances a sequence"

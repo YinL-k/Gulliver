@@ -12,7 +12,7 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
-from ..config import Connection
+from ..config import ConfigError, Connection
 from .base import HEURISTIC, Engine, EngineError, Estimate, ExecResult, TableInfo
 
 TYPE_BYTES = {
@@ -60,7 +60,17 @@ class DuckDBEngine(Engine):
             raise EngineError(f"Could not open DuckDB database {path}: {exc}") from exc
         threads = self.params.get("threads")
         if threads:
-            self.con.execute(f"SET threads = {int(threads)}")
+            try:
+                self.con.execute(f"SET threads = {int(threads)}")
+            except duckdb.Error:  # already set and locked by an earlier connection to the same file
+                pass
+        from ..security import sandbox_duckdb
+
+        try:  # file and network access limited to allowed_paths, then the settings are locked
+            self.sandbox = sandbox_duckdb(self.con, connection)
+        except (duckdb.Error, ConfigError) as exc:
+            self.con.close()
+            raise EngineError(f"Could not sandbox DuckDB database {path}: {_clean_error(exc)}") from exc
 
     def close(self) -> None:
         try:
@@ -132,6 +142,11 @@ class DuckDBEngine(Engine):
         if not args:
             return TableInfo(name=ref, kind="file", notes=["could not read the file path"])
         path = args[0].this
+        from ..security import check_path, policy_for
+
+        refused = check_path(path, policy_for(self.connection))
+        if refused is not None:  # do not even reveal whether the file exists
+            return TableInfo(name=ref, kind="file", notes=[f"{refused.label}: {refused.reason}"])
         files = sorted(glob.glob(path)) if any(ch in path for ch in "*?[") else [path]
         files = [f for f in files if os.path.exists(f)]
         size = sum(os.path.getsize(f) for f in files) if files else None

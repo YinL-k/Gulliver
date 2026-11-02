@@ -7,6 +7,9 @@ Gulliver is read-first. It understands three kinds of statements:
          rehearsed (rehearsals never write); a real run needs allow_write=True
   block  everything else (DELETE, UPDATE, DROP, TRUNCATE, ALTER, MERGE, GRANT, several
          statements at once, unparsable SQL)               -> refused
+
+A read or write that calls a side-effect function, runs SQL hidden in a string, or reads a file or URL outside
+the allowed folders is also refused, with a code GS001-GS004 (see security.py).
 """
 
 from __future__ import annotations
@@ -17,6 +20,9 @@ from dataclasses import dataclass, field
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
+
+from .security import SecurityPolicy
+from .security import check as security_check
 
 READ_ROOTS = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)
 
@@ -31,6 +37,7 @@ class Statement:
     select: exp.Expression | None = None   # the read part (for write statements too)
     target: str | None = None              # write target table
     tables: list[str] = field(default_factory=list)
+    code: str = ""                         # GS001-GS004 when a security rule refused it
 
     @property
     def sql_hash(self) -> str:
@@ -40,6 +47,8 @@ class Statement:
         out = {"kind": self.kind, "tables": self.tables}
         if self.reason:
             out["reason"] = self.reason
+        if self.code:
+            out["code"] = self.code
         if self.target:
             out["write_target"] = self.target
         return out
@@ -79,7 +88,19 @@ def table_ref(table: exp.Table, dialect: str) -> str:
     return bare.sql(dialect=dialect)
 
 
-def classify(sql: str, dialect: str = "duckdb") -> Statement:
+def classify(sql: str, dialect: str = "duckdb", policy: SecurityPolicy | None = None) -> Statement:
+    """What the statement is and whether it may run. `policy` comes from the connection
+    (security.policy_for); without it, path allowlists cannot be checked (offline lint)."""
+    statement = _classify(sql, dialect)
+    if statement.kind != "block" and statement.tree is not None:
+        hit = security_check(statement.tree, dialect, policy, statement.kind)
+        if hit is not None:
+            return Statement(sql, dialect, "block", reason=f"{hit.label}: {hit.reason}", tree=statement.tree,
+                             tables=statement.tables, code=hit.code)
+    return statement
+
+
+def _classify(sql: str, dialect: str) -> Statement:
     text = _strip_trailing(sql)
     if not text:
         return Statement(sql, dialect, "block", reason="Empty SQL.")

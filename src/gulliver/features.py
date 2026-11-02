@@ -21,6 +21,7 @@ from .config import ConfigError, Settings
 from .core import _engine, _error, _fmt_bytes, _fmt_usd, _gate, _store, _table_infos
 from .engines import Engine, EngineError, dialect_for
 from .lint import lint
+from .security import policy_for
 from .sqlsafety import classify, sql_fingerprint
 from .store import Store, iso, now_utc
 
@@ -39,7 +40,7 @@ def _gated_run(settings: Settings, conn_name: str, engine: Engine, sql: str, pur
     """Estimate + gate + execute one query Gulliver generated itself. Raises Blocked when it may not run."""
     store = _store(settings)
     dialect = dialect_for(engine.name)
-    stmt = classify(sql, dialect)
+    stmt = classify(sql, dialect, policy_for(engine.connection))
     if stmt.kind != "read":
         raise Blocked({"status": "block", "next_step": f"Gulliver refused its own {purpose} query: {stmt.reason}"})
     infos, _ = _table_infos(engine, stmt)
