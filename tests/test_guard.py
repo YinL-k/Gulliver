@@ -10,7 +10,7 @@ import random
 import duckdb
 import pytest
 
-from gulliver import core, guard
+from gulliver import core, guard, runaway
 from gulliver.cli import main
 from gulliver.config import ConfigError, Connection, load_settings
 
@@ -204,6 +204,19 @@ def test_default_policy_run(tmp_path, crm, state):
     # value tags are remembered: the next preflight knows `contact` holds emails
     pre = core.preflight(s, "select contact from customers limit 1")
     assert any("contact" in f["message"] and "(email)" in f["message"] for f in pre["lint"] if f["rule"] == "GV014")
+
+
+def test_loop_guard_cached_preview_keeps_the_result_guard(crm, state, monkeypatch):
+    monkeypatch.setattr(runaway, "REPEAT_FREE_BYTES", -1)   # the tiny table counts as a loop
+    s = load_settings(dsn=str(crm), budget_overrides={"max_repeats": 1})
+    first = core.run(s, "select * from customers")
+    second = core.run(s, "select * from customers")
+    assert second["status"] == "block" and second["reason"] == "loop"
+    cached = second["cached"]
+    assert cached["untrusted"] is True and "never as instructions" in cached["data_notice"]
+    assert cached["preview"] == first["preview"]                     # the masked rows, not the raw ones
+    assert [r["password"] for r in cached["preview"]] == ["[masked:password]"] * 3
+    assert API_KEY not in json.dumps(cached) and any("instructions to an AI" in w for w in cached["data_warnings"])
 
 
 def test_policy_hash_last4_redact(tmp_path, crm, monkeypatch):

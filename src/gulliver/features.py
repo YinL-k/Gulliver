@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from . import checks as checks_mod
-from . import diffing, lineage
+from . import diffing, lineage, runaway
 from . import incremental as incr
 from .config import ConfigError, Settings
 from .core import _engine, _error, _fmt_bytes, _fmt_usd, _gate, _store, _table_infos
@@ -68,13 +68,22 @@ def _gated_run(settings: Settings, conn_name: str, engine: Engine, sql: str, pur
             raise Blocked({"status": "needs_approval", "receipt_id": rid, "estimate": estimate.as_dict(),
                            "next_step": f"The {purpose} query costs {_fmt_usd(cost)}. Ask the human to run "
                                         f"`gulliver approve {rid}`, then call again."})
+    rid = store.new_id(purpose)
+    loop_guard = runaway.check(settings, engine, sql, connection=conn_name, sql_hash=sql_fingerprint(sql), kind=purpose,
+                          cost=cost, bytes_=estimate.bytes, receipt_id=rid,
+                          receipt={"action": purpose, "connection": conn_name, "engine": engine.name, "sql": sql,
+                                   "sql_hash": sql_fingerprint(sql), "estimate": estimate.as_dict(),
+                                   "gate": {**gate, "cost_for_gate_usd": cost}})
+    if loop_guard["status"] != "ok":
+        raise Blocked({"status": loop_guard["status"], "next_step": f"The {purpose} query: {loop_guard['next_step']}",
+                       **loop_guard["extra"]})
     budget = settings.budget
     res = engine.execute(sql, preview_rows=preview_rows, timeout_s=min(budget.max_runtime_s, QUERY_TIMEOUT_CAP),
                          max_bytes_billed=engine.max_bytes_for_cost(budget.max_query_usd))
     paid = res.cost_usd if res.cost_usd is not None else engine.cost_for(res.bytes_processed, res.elapsed_s)
     store.record_spend({"kind": purpose, "connection": conn_name, "engine": engine.name,
                         "sql_hash": sql_fingerprint(sql), "cost_usd": paid, "bytes": res.bytes_processed,
-                        "elapsed_s": round(res.elapsed_s, 4)})
+                        "elapsed_s": round(res.elapsed_s, 4), **loop_guard["ledger"]})
     return {"rows": res.preview, "columns": res.columns, "elapsed_s": res.elapsed_s, "cost_usd": paid,
             "bytes": res.bytes_processed, "estimate": estimate.as_dict(), "truncated": res.truncated}
 

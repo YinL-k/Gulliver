@@ -158,6 +158,7 @@ def _add_common(p: argparse.ArgumentParser, defaults: bool) -> None:
     p.add_argument("--config", help="Path to gulliver.toml (default: ./gulliver.toml or $GULLIVER_CONFIG)", **extra)
     p.add_argument("--dsn", help="Connection string: file.duckdb, postgresql://..., bigquery://project, ...", **extra)
     p.add_argument("-c", "--connection", help="Connection name from gulliver.toml", **extra)
+    p.add_argument("--agent", help="Who is asking (ledger, per-agent budget, query tags); GULLIVER_AGENT wins", **extra)
     if defaults:
         p.add_argument("--json", action="store_true", help="Print JSON (for agents and scripts)")
     else:
@@ -321,6 +322,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("suite", choices=["security"])
     p.add_argument("--corpus", help="Another test set file (TOML, same format as the built-in one)")
 
+    p = sub.add_parser("spend", help="Money and bytes spent, by agent, day, table, session, task, connection or kind")
+    p.add_argument("--by", choices=["agent", "day", "table", "session", "task", "connection", "kind"], default="agent")
+    p.add_argument("--days", type=int, default=7, help="How many days back, today included (default 7)")
+    p.add_argument("--format", choices=["markdown", "csv"], default="markdown")
+
+    p = sub.add_parser("audit", help="Check the hash chain over the ledger, receipts and approvals")
+    p.add_argument("action", choices=["verify"])
+    p.add_argument("--head", help="A head hash printed by an earlier verify: prove nothing up to it changed")
+
     p = sub.add_parser("tools", help="Print tool definitions for MCP, OpenAI or Gemini function calling")
     p.add_argument("--format", choices=["mcp", "openai", "gemini"], default="mcp")
 
@@ -334,6 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    from .identity import from_env, use
+
+    with use(from_env(args.agent, default_agent="cli", source="cli")):
+        return _main(parser, args)
+
+
+def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     try:
         if args.command == "demo":
             from .demo import build_demo
@@ -455,6 +472,16 @@ def main(argv: list[str] | None = None) -> int:
                                         ranges=args.ranges, fresh=args.fresh, min_rows=args.min_rows,
                                         max_change_pct=args.max_change)
             return _emit(result, args.json)
+        if args.command in ("spend", "audit"):
+            from . import runaway
+
+            if args.command == "audit":
+                return _emit(runaway.audit_verify(settings, head=args.head), args.json)
+            result = runaway.spend(settings, by=args.by, days=args.days)
+            if args.json or result["status"] != "ok":
+                return _emit(result, args.json)
+            print(runaway.render_spend(result, args.format), end="")
+            return 0
         if args.command == "status":
             result = core.status(settings)
         elif args.command == "inspect" and (args.sensitive or args.scan):

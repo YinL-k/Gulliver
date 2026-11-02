@@ -42,6 +42,13 @@ class Budget:
     max_output_rows: int = 200           # rows handed back to the agent
     max_output_chars: int = 50_000       # characters of preview handed back (0 = no limit); see guard.py
     max_cell_chars: int = 1_000          # longer text cells are cut in the preview (0 = no limit)
+    # runaway guard (runaway.py): 0 switches a limit off
+    session_usd: float = 0.0             # spend per agent session (MCP connection / GULLIVER_SESSION)
+    agent_day_usd: dict[str, float] = field(default_factory=dict, hash=False)  # {default = 5, "claude-code" = 10}
+    max_repeats: int = 5                 # identical runs allowed per window before the loop guard steps in
+    repeat_window_min: float = 30.0
+    velocity_usd: float = 2.00           # one agent/session spending more than this ...
+    velocity_window_min: float = 10.0    # ... within this many minutes needs a human approval
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> Budget:
@@ -49,7 +56,7 @@ class Budget:
         unknown = set(data) - known
         if unknown:
             raise ConfigError(f"Unknown budget keys: {', '.join(sorted(unknown))}")
-        return cls(**{k: _coerce(cls, k, v) for k, v in data.items()})
+        return cls(**{k: (_agent_limits(v) if k == "agent_day_usd" else _coerce(cls, k, v)) for k, v in data.items()})
 
     def as_dict(self) -> dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -66,7 +73,21 @@ _ENV_BUDGET = {
     "GULLIVER_MAX_OUTPUT_ROWS": "max_output_rows",
     "GULLIVER_MAX_OUTPUT_CHARS": "max_output_chars",
     "GULLIVER_MAX_CELL_CHARS": "max_cell_chars",
+    "GULLIVER_SESSION_USD": "session_usd",
+    "GULLIVER_AGENT_DAY_USD": "agent_day_usd",
+    "GULLIVER_MAX_REPEATS": "max_repeats",
+    "GULLIVER_REPEAT_WINDOW_MIN": "repeat_window_min",
+    "GULLIVER_VELOCITY_USD": "velocity_usd",
 }
+
+
+def _agent_limits(value: Any) -> dict[str, float]:
+    """agent_day_usd = 5 (every agent) or a table {default = 5, "claude-code" = 10}."""
+    items = value.items() if isinstance(value, dict) else [("default", value)]
+    try:
+        return {str(k): float(v) for k, v in items}
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Budget value agent_day_usd={value!r} must be a number or a table of numbers") from exc
 
 
 def _coerce(cls: type, key: str, value: Any) -> Any:

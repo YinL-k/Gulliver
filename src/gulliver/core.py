@@ -86,6 +86,12 @@ def _store(settings: Settings) -> Store:
     return Store(settings.state_dir)
 
 
+def _runaway():
+    from . import runaway  # imported late: runaway uses helpers from this module
+
+    return runaway
+
+
 # -- status ----------------------------------------------------------------------------
 def status(settings: Settings) -> dict[str, Any]:
     spent = _store(settings).spent_today()
@@ -98,6 +104,7 @@ def status(settings: Settings) -> dict[str, Any]:
         "budget": budget.as_dict(),
         "spent_today": spent,
         "remaining_today_usd": round(max(0.0, budget.day_usd - spent["usd"]), 6),
+        "caller": _runaway().caller_status(settings),
         "workflow": WORKFLOW,
         "next_step": "Call gulliver_inspect to see which tables are big, then gulliver_preflight your SQL.",
     }
@@ -340,6 +347,14 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
         else:
             return _error(f"method '{method}' is not supported by {engine.name}; use one of {', '.join(methods)}")
 
+        result["receipt_id"] = store.new_id("rehearse")
+        loop_guard = _runaway().check(settings, engine, sql, connection=conn.name, sql_hash=statement.sql_hash,
+                                 kind="rehearsal", cost=None, bytes_=None, receipt_id=result["receipt_id"],
+                                 repeats=False)
+        if loop_guard["status"] != "ok":
+            result.update(status=loop_guard["status"], next_step=loop_guard["next_step"], **loop_guard["extra"])
+            store.save_receipt(result)
+            return result
         baseline = engine.baseline_latency()
         rungs: list[dict[str, Any]] = []
         stopped: str | None = None
@@ -383,7 +398,8 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
             spent += cost or 0.0
             store.record_spend({"kind": "rehearsal", "connection": conn.name, "engine": conn.engine,
                                 "sql_hash": statement.sql_hash, "fraction": fraction,
-                                "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4)})
+                                "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4),
+                                **loop_guard["ledger"]})
             rungs.append({"fraction": fraction, "elapsed_s": round(res.elapsed_s, 4), "output_rows": res.rows,
                           "bytes": res.bytes_processed, "cost_usd": cost, "sampled_tables": sampled_tables})
 
@@ -574,7 +590,13 @@ def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | N
 
     preview_rows = max(0, min(int(max_rows) if max_rows is not None else budget.max_output_rows, budget.max_output_rows))
     write = statement_kind == "write"
+    pre.setdefault("receipt_id", store.new_id("run"))  # known before the run, so the query can carry it as a tag
     with _engine(settings, connection, read_only=not write) as (_, engine):
+        loop_guard = _runaway().check(settings, engine, sql, connection=conn.name, sql_hash=pre["sql_hash"], kind="run",
+                                 cost=cost_for_gate, bytes_=estimate.get("bytes"), receipt_id=pre["receipt_id"])
+        if loop_guard["status"] != "ok":
+            return finish(loop_guard["status"], loop_guard["next_step"], **loop_guard["extra"])
+        pre.update(loop_guard["extra"])
         cap = engine.max_bytes_for_cost(budget.max_query_usd)
         try:
             res = engine.execute(sql.strip().rstrip(";") if write else pre["sql"].rstrip(";"),
@@ -584,7 +606,8 @@ def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | N
                           error=str(exc))
         cost = res.cost_usd if res.cost_usd is not None else engine.cost_for(res.bytes_processed, res.elapsed_s)
     store.record_spend({"kind": "run", "connection": conn.name, "engine": conn.engine, "sql_hash": pre["sql_hash"],
-                        "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4)})
+                        "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4),
+                        **loop_guard["ledger"]})
 
     actual = {"runtime_s": round(res.elapsed_s, 4), "rows": res.rows, "bytes": res.bytes_processed,
               "cost_usd": round(cost, 6) if cost is not None else None}
