@@ -68,8 +68,16 @@ def _print_human(result: dict[str, Any]) -> None:
         changes = result.get("changes") or []
         if not changes:
             print("Nothing to rewrite automatically.")
+        from .verify import human_lines
+
         for c in changes:
             print(f"{c['rule']} [{c['meaning']}]\n  before: {c['before']}\n  after:  {c['after']}\n  why:    {c['note']}")
+            for line in human_lines(c):
+                print(line)
+        for c in result.get("dropped") or []:
+            print(f"DROPPED {c['rule']} (claimed the same rows, but generated data disagrees)")
+            for line in human_lines(c):
+                print(line)
         if changes:
             print("\n-- fixed SQL\n" + result["fixed_sql"])
         if (result.get("saving") or {}).get("summary"):
@@ -181,6 +189,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=None, help="Row limit to add in --mode all")
     p.add_argument("-o", "--output", metavar="PATH",
                    help="Write the rewritten SQL to PATH when there are changes (still prints the change list)")
+    p.add_argument("--verify", action="store_true",
+                   help="Test every change on generated edge-case data in a private in-memory DuckDB")
+    p.add_argument("--cases", type=int, default=None, help="Generated cases for --verify (default 200)")
+    p.add_argument("--seed", type=int, default=0, help="Seed for --verify; the same seed gives the same cases")
+    p.add_argument("--timezone", default=None,
+                   help="Session time zone for --verify (default: try several, incl. daylight-saving ones)")
 
     p = sub.add_parser("preflight", help="Estimate cost and size without running")
     _add_sql_args(p)
@@ -319,7 +333,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise
                 settings = None
             result = fix(settings, _read_sql(args), connection=args.connection, dialect=args.dialect,
-                        mode=args.mode, limit=args.limit)
+                        mode=args.mode, limit=args.limit, verify=args.verify, cases=args.cases, seed=args.seed,
+                        timezone=args.timezone)
             out_path = getattr(args, "output", None)
             if out_path and result.get("changes") and result.get("fixed_sql") is not None:
                 Path(out_path).write_text(result["fixed_sql"], encoding="utf-8")

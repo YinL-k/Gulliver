@@ -113,7 +113,8 @@ def build_server() -> Any:
                  description="Rewrite SQL so it is cheaper on big data (e.g. DATE(ts) = '...' becomes a range on ts "
                              "so partitions are pruned) and say per change whether the rows stay exactly the same. "
                              "With a connection it estimates before vs after (no data read). mode='all' adds "
-                             "rewrites that change the result on purpose (LIMIT, approx count, UNION ALL, NOT EXISTS).")
+                             "rewrites that change the result on purpose (LIMIT, approx count, UNION ALL, NOT EXISTS). "
+                             "verify=true tests each change on generated edge-case data.")
     def gulliver_fix(
         sql: SQL,
         connection: CONNECTION = None,
@@ -123,10 +124,20 @@ def build_server() -> Any:
                                                                   "rows. all: also result-changing rewrites.")] = "safe",
         limit: Annotated[int | None, Field(description="Row limit to add in mode 'all' when the result is "
                                                        "unbounded.", ge=1)] = None,
+        verify: Annotated[bool, Field(description="Also test every change on generated edge-case data (NULLs, "
+                                                  "duplicates, date boundaries, time zones) in a private in-memory "
+                                                  "DuckDB, and return a small counterexample when rows differ. "
+                                                  "A test, not a proof: labels never change because of it.")] = False,
+        cases: Annotated[int | None, Field(description="Generated cases for verify (default 200).", ge=1,
+                                           le=5000)] = None,
+        seed: Annotated[int, Field(description="Seed for verify; the same seed gives the same cases.")] = 0,
+        timezone: Annotated[str | None, Field(description="Session time zone for verify, e.g. 'Europe/Amsterdam'. "
+                                                          "Omit to try several.")] = None,
     ) -> dict[str, Any]:
         from .fixer import fix
 
-        return _guard(fix, sql, connection=connection, dialect=dialect, mode=mode, limit=limit)
+        return _guard(fix, sql, connection=connection, dialect=dialect, mode=mode, limit=limit, verify=verify,
+                      cases=cases, seed=seed, timezone=timezone)
 
     @server.tool(name="gulliver_preflight", annotations=READ_ONLY,
                  description="Estimate bytes, rows and money for a query WITHOUT running it, plus scale lint and the "

@@ -8,12 +8,14 @@ does the rewrite and labels every change with a guarantee:
   assumes  same rows IF the column is a DATE or a TIMESTAMP without time zone (the type was not known)
                                                                        -> only with mode="all"
   nulls    same rows, unless a NOT IN subquery returns NULL (then the original returns nothing,
-           which is almost never what was meant)                       -> only with mode="all"
+           which is almost never what was meant) or the outer column is NULL
+                                                                       -> only with mode="all"
   changes  the result changes on purpose (LIMIT, approximate count, UNION ALL)
                                                                        -> only with mode="all"
 
 With a connection it also estimates the original and the fixed query (free: dry run / EXPLAIN),
-so the agent and the human see the saving instead of trusting it.
+so the agent and the human see the saving instead of trusting it. With verify=True every change is
+also tested on generated edge-case data (verify.py); labels never change because of a test.
 
 Why the date rewrite needs the type: on text columns a range compares strings, not dates; on
 TIMESTAMP WITH TIME ZONE a day can start twice (DST at midnight) or per-row offsets apply; on
@@ -42,12 +44,29 @@ CHANGES = "changes"
 GUARANTEE_TEXT = {
     SAME: "returns exactly the same rows",
     ASSUMES: "same rows if the column is a DATE or a TIMESTAMP without time zone",
-    NULLS: "same rows unless the subquery returns NULL",
+    NULLS: "same rows unless a NULL is involved (in the subquery, or in the outer column)",
     CHANGES: "changes the result on purpose",
 }
 
 _ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ZONED = re.compile(r"WITH TIME ZONE|(?<!N)TZ")  # TIMESTAMPTZ, TIMESTAMP_TZ, TIMESTAMP_LTZ; not TIMESTAMP_NTZ
+
+
+class _Log(list):
+    """The changes a rewrite applies. `offer` numbers every candidate change in a fixed order and applies it
+    unless its number is in `skip`, so a verifier can build the query with one change only, or without one."""
+
+    def __init__(self, skip: frozenset[int] = frozenset()):
+        super().__init__()
+        self.skip = skip
+        self.offered: list[Change] = []
+
+    def offer(self, change: Change) -> bool:
+        self.offered.append(change)
+        if len(self.offered) - 1 in self.skip:
+            return False
+        self.append(change)
+        return True
 
 
 @dataclass
@@ -279,7 +298,7 @@ def _rewrite_range(cmp: exp.Expression, where: exp.Where, dialect: str,
 
 
 def _fix_ranges(tree: exp.Expression, dialect: str, tables: dict[str, dict[str, str]], mode: str,
-                changes: list[Change]) -> None:
+                changes: _Log) -> None:
     cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
     for select in list(tree.find_all(exp.Select)):
         where = select.args.get("where")
@@ -302,7 +321,6 @@ def _fix_ranges(tree: exp.Expression, dialect: str, tables: dict[str, dict[str, 
             if isinstance(repl, exp.Paren) and isinstance(cmp.parent, (exp.Where, exp.And)):
                 repl = repl.this  # AND inside AND/WHERE needs no brackets
             before = cmp.sql(dialect=dialect)
-            cmp.replace(repl)
             note = f"Filters the raw column {col.sql(dialect=dialect)} by range, so partitions, indexes and min/max " \
                    "statistics can skip data."
             if guarantee == SAME:
@@ -310,11 +328,12 @@ def _fix_ranges(tree: exp.Expression, dialect: str, tables: dict[str, dict[str, 
             else:
                 note += (f" The type of {col.sql(dialect=dialect)} is unknown: only use this if it is a DATE or a "
                          "TIMESTAMP without time zone (not text, not with time zone).")
-            changes.append(Change("GV005", guarantee, before, repl.sql(dialect=dialect), note))
+            if changes.offer(Change("GV005", guarantee, before, repl.sql(dialect=dialect), note)):
+                cmp.replace(repl)
 
 
 # -- NOT IN (subquery) -> NOT EXISTS (GV012) ---------------------------------------------
-def _fix_not_in(tree: exp.Expression, dialect: str, changes: list[Change]) -> None:
+def _fix_not_in(tree: exp.Expression, dialect: str, changes: _Log) -> None:
     for not_node in list(tree.find_all(exp.Not)):
         inner = not_node.this
         if not isinstance(inner, exp.In) or inner.args.get("query") is None:
@@ -347,24 +366,26 @@ def _fix_not_in(tree: exp.Expression, dialect: str, changes: list[Change]) -> No
         new_sub.set("expressions", [exp.Literal.number(1)])
         repl = exp.Not(this=exp.Exists(this=new_sub))
         before = not_node.sql(dialect=dialect)
-        not_node.replace(repl)
-        changes.append(Change("GV012", NULLS, before, repl.sql(dialect=dialect),
-                              "NOT EXISTS plans as an anti-join. The only difference: when the subquery returns a "
-                              "NULL, NOT IN returns no rows at all, NOT EXISTS ignores the NULL."))
+        if changes.offer(Change("GV012", NULLS, before, repl.sql(dialect=dialect),
+                                "NOT EXISTS plans as an anti-join. It differs only with NULLs: when the subquery "
+                                "returns a NULL, NOT IN returns no rows at all (NOT EXISTS ignores the NULL); and a "
+                                "row whose outer column is NULL is dropped by NOT IN when the subquery has rows, but "
+                                "kept by NOT EXISTS.")):
+            not_node.replace(repl)
 
 
 # -- result-changing rewrites (opt-in) -----------------------------------------------------
-def _fix_limit(tree: exp.Expression, dialect: str, limit: int, changes: list[Change]) -> None:
+def _fix_limit(tree: exp.Expression, dialect: str, limit: int, changes: _Log) -> None:
     outer = _outer_select(tree)
     if outer is None or outer.args.get("limit") or outer.args.get("fetch") or _has_aggregation(outer):
         return
-    outer.set("limit", exp.Limit(expression=exp.Literal.number(limit)))
-    changes.append(Change("GV002", CHANGES, "(no LIMIT)", f"LIMIT {limit}",
-                          f"Returns at most {limit} rows, for exploring. Note: on BigQuery a LIMIT does not lower "
-                          "the bytes billed; filters and fewer columns do."))
+    if changes.offer(Change("GV002", CHANGES, "(no LIMIT)", f"LIMIT {limit}",
+                            f"Returns at most {limit} rows, for exploring. Note: on BigQuery a LIMIT does not lower "
+                            "the bytes billed; filters and fewer columns do.")):
+        outer.set("limit", exp.Limit(expression=exp.Literal.number(limit)))
 
 
-def _fix_approx(tree: exp.Expression, dialect: str, changes: list[Change]) -> None:
+def _fix_approx(tree: exp.Expression, dialect: str, changes: _Log) -> None:
     if dialect == "postgres":
         return  # no built-in approximate distinct count
     for count in list(tree.find_all(exp.Count)):
@@ -373,18 +394,19 @@ def _fix_approx(tree: exp.Expression, dialect: str, changes: list[Change]) -> No
             continue
         repl = exp.ApproxDistinct(this=distinct.expressions[0].copy())
         before = count.sql(dialect=dialect)
-        count.replace(repl)
-        changes.append(Change("GV007", CHANGES, before, repl.sql(dialect=dialect),
-                              "Approximate distinct count (HyperLogLog): usually within about 1-2%, far less memory."))
+        if changes.offer(Change("GV007", CHANGES, before, repl.sql(dialect=dialect),
+                                "Approximate distinct count (HyperLogLog): usually within about 1-2%, far less "
+                                "memory.")):
+            count.replace(repl)
 
 
-def _fix_union(tree: exp.Expression, dialect: str, changes: list[Change]) -> None:
+def _fix_union(tree: exp.Expression, dialect: str, changes: _Log) -> None:
     for union in list(tree.find_all(exp.Union)):
-        if union.args.get("distinct"):
+        if union.args.get("distinct") and changes.offer(
+                Change("GV009", CHANGES, "UNION", "UNION ALL",
+                       "Keeps duplicate rows instead of sorting/hashing both sides to remove them. "
+                       "Same result only if the two sides cannot overlap.")):
             union.set("distinct", False)
-            changes.append(Change("GV009", CHANGES, "UNION", "UNION ALL",
-                                  "Keeps duplicate rows instead of sorting/hashing both sides to remove them. "
-                                  "Same result only if the two sides cannot overlap."))
 
 
 # -- driver -------------------------------------------------------------------------------
@@ -394,14 +416,20 @@ def rewrite(sql: str, dialect: str = "duckdb", mode: str = "safe", limit: int = 
 
     `table_info` maps lower-case table refs to engine metadata with `columns` ({name, type}); without it,
     date rewrites cannot be proven and are only offered in mode "all" (guarantee "assumes")."""
+    return _rewrite(sql, dialect, mode, limit, table_info)[0]
+
+
+def _rewrite(sql: str, dialect: str, mode: str, limit: int, table_info: dict[str, dict] | None,
+             skip: frozenset[int] = frozenset()) -> tuple[dict[str, Any], list[Change]]:
+    """rewrite(), leaving out the offered changes numbered in `skip`; also returns every offered change."""
     if mode not in ("safe", "all"):
         raise ValueError("mode must be 'safe' or 'all'")
     statement: Statement = classify(sql, dialect)
     if statement.kind == "block" or statement.tree is None or statement.select is None:
         return {"status": "block", "statement": statement.public(), "changes": [],
-                "next_step": "Send a single SELECT (or CREATE/INSERT ... SELECT). " + statement.reason}
+                "next_step": "Send a single SELECT (or CREATE/INSERT ... SELECT). " + statement.reason}, []
     before_findings = lint(statement.select, dialect, table_info)
-    changes: list[Change] = []
+    changes = _Log(skip)
     tree = statement.tree
     _fix_ranges(statement.select, dialect, table_columns(table_info), mode, changes)
     if mode == "all":
@@ -422,13 +450,16 @@ def rewrite(sql: str, dialect: str = "duckdb", mode: str = "safe", limit: int = 
         "remaining": [f.as_dict() for f in after_findings],
         "sql_hash_before": statement.sql_hash,
         "sql_hash_after": after.sql_hash,
-    }
+    }, changes.offered
 
 
 # -- with a connection: prove the saving --------------------------------------------------
 def fix(settings: Any, sql: str, connection: str | None = None, dialect: str | None = None,
-        mode: str = "safe", limit: int | None = None) -> dict[str, Any]:
-    """Rewrite the SQL and, when a connection is available, estimate both versions (no data is read)."""
+        mode: str = "safe", limit: int | None = None, verify: bool = False, cases: int | None = None,
+        seed: int = 0, timezone: str | None = None) -> dict[str, Any]:
+    """Rewrite the SQL and, when a connection is available, estimate both versions (no data is read).
+
+    verify=True also tests every change on generated edge-case data (see verify.py)."""
     from .core import _engine, _fmt_bytes, _fmt_usd, _table_infos
     from .engines import EngineError, dialect_for
 
@@ -457,7 +488,13 @@ def fix(settings: Any, sql: str, connection: str | None = None, dialect: str | N
                 notes.append(f"metadata unavailable: {exc}")
                 engine = None
 
-        result = rewrite(sql, dialect, mode=mode, limit=max_rows, table_info=infos or None)
+        if verify:
+            from . import verify as verifier
+
+            result = verifier.verify_rewrite(sql, dialect, mode, max_rows, infos or None, seed=seed,
+                                             cases=cases or verifier.DEFAULT_CASES, timezone=timezone)
+        else:
+            result = rewrite(sql, dialect, mode=mode, limit=max_rows, table_info=infos or None)
         result = {"action": "fix", "dialect": dialect, **result}
         if result.get("status") == "block":
             return result
@@ -499,7 +536,7 @@ def fix(settings: Any, sql: str, connection: str | None = None, dialect: str | N
         if mode == "safe" and _opt_in_rules(result["remaining"]):
             result["next_step"] += (" mode='all' offers rewrites that change the result slightly or need a column "
                                     "type Gulliver could not check.")
-        return result
+        return _verified(result)
     result["status"] = "warn" if remaining_errors else "ok"
     if result["same_result"]:
         result["next_step"] = "Use fixed_sql: it returns exactly the same rows. Call gulliver_preflight with it."
@@ -509,6 +546,14 @@ def fix(settings: Any, sql: str, connection: str | None = None, dialect: str | N
                                "fixed_sql.")
     if remaining_errors:
         result["next_step"] += " Lint errors remain (see remaining); fix those by hand first."
+    return _verified(result)
+
+
+def _verified(result: dict[str, Any]) -> dict[str, Any]:
+    if "verify" in result:
+        from .verify import finish
+
+        finish(result)
     return result
 
 
