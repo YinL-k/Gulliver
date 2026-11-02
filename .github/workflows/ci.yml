@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, validation/order-by-random-lint]
   pull_request:
 
 permissions:
@@ -13,6 +13,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: New tests fail on upstream and pass with the implementation
+        shell: bash
+        run: |
+          git restore --source=6935cd18f195554c1c46fd6b2ff4497bd42e2dc2 -- src
+          set +e
+          python -m pytest -q tests/test_lint.py -k 'order_by_random or random_outside'
+          status=$?
+          set -e
+          git restore --source=HEAD -- src
+          test "$status" -eq 1
+          python -m pytest -q tests/test_lint.py -k 'order_by_random or random_outside'
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
