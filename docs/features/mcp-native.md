@@ -99,7 +99,7 @@ with a message like `1% sample: 4,021 rows in 0.03s`) when the client asks for p
 
 ```bash
 gulliver-mcp --toolset core                  # status, inspect, lint, fix, preflight, rehearse, run, receipt
-gulliver-mcp --toolset pipeline              # status, inspect, receipt + impact, drift, diff, translate, incremental, check
+gulliver-mcp --toolset pipeline              # status, inspect, receipt + impact, drift, diff, translate, incremental, check, top
 gulliver-mcp --toolset core,gulliver_check   # mix sets and tool names
 gulliver mcp --toolset core                  # same through the main CLI
 gulliver tools --format openai --toolset core
