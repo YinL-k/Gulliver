@@ -92,7 +92,8 @@ Reasons that come with a status:
 ## Reading a rehearsal
 
 `prediction.<metric>.value` is the expected full-run value; `low` and `high` give the range.
-`exponent` near 1 means it grows with the data; above 1.3 means it grows faster (a join that multiplies rows).
+`exponent` near 1 means it grows with the data; above 1.3 means it grows faster (with `sample=all`, a join that
+multiplies rows). In the default mode a join that multiplies rows shows up as a warning "the query multiplies rows".
 `confidence` is `high`, `medium` or `low`. Treat `low` as a rough range, not a number.
 
 ## Rules you cannot change

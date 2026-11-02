@@ -729,9 +729,13 @@ def _rehearse_all(settings: Settings, connection: str | None, pairs: list, entri
     for (_change, old, new), entry in zip(pairs, entries, strict=True):
         if new is None or entry["classification"] in ("cosmetic", "unknown") or "error" in (entry.get("cost") or {}):
             continue
-        runs = {"head": core_rehearse(settings, new.engine_sql, connection, fractions=REHEARSAL_FRACTIONS)}
+        # sample="all": every occurrence is sampled on its own, so a join that multiplies rows shows up as an
+        # exponent near 2 (the default mode keeps one side full and grows linearly, which hides it here)
+        runs = {"head": core_rehearse(settings, new.engine_sql, connection, fractions=REHEARSAL_FRACTIONS,
+                                      sample="all")}
         if old is not None:
-            runs["base"] = core_rehearse(settings, old.engine_sql, connection, fractions=REHEARSAL_FRACTIONS)
+            runs["base"] = core_rehearse(settings, old.engine_sql, connection, fractions=REHEARSAL_FRACTIONS,
+                                         sample="all")
         growth: dict[str, Any] = {"fractions": REHEARSAL_FRACTIONS}
         spent = 0.0
         for side, res in runs.items():

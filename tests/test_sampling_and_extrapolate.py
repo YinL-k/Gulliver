@@ -7,8 +7,8 @@ from gulliver.sampling import percent_text, sample_query
 from gulliver.sqlsafety import classify
 
 
-def clause(ref):
-    return "TABLESAMPLE 10% (bernoulli, 42)"
+def clause(ref, occurrence=0):
+    return f"TABLESAMPLE 10% (bernoulli, {42 + occurrence})"
 
 
 def test_percent_text():
@@ -30,6 +30,30 @@ def test_sample_only_selected_tables():
     sql, sampled = sample_query(stmt.select, "duckdb", clause, only={"events"})
     assert sampled == ["events"]
     assert "JOIN users AS u" in sql
+
+
+def test_self_join_occurrences_get_their_own_sample():
+    stmt = classify("select a.id from events a join events b on a.user_id = b.user_id")
+    sql, sampled = sample_query(stmt.select, "duckdb", clause)
+    assert sampled == ["events"]
+    assert "(SELECT * FROM events TABLESAMPLE 10% (bernoulli, 42)) AS a" in sql
+    assert "(SELECT * FROM events TABLESAMPLE 10% (bernoulli, 43)) AS b" in sql
+    sql, _ = sample_query(stmt.select, "duckdb", clause, first_only=True)
+    assert "(SELECT * FROM events TABLESAMPLE 10% (bernoulli, 42)) AS a" in sql
+    assert "JOIN events AS b" in sql
+
+
+def test_cte_used_twice_is_split_per_use():
+    stmt = classify("with e as (select * from events), f as (select * from e where id > 1) "
+                    "select * from f a join f b on a.user_id = b.user_id join users u on u.user_id = a.user_id")
+    sql, _ = sample_query(stmt.select, "duckdb", clause, only={"events"}, first_only=True)
+    con = duckdb.connect()
+    con.execute("create table events as select i as id, i % 10 as user_id from range(100) t(i)")
+    con.execute("create table users as select i as user_id from range(10) t(i)")
+    con.execute(sql)  # still valid SQL
+    assert sql.count("TABLESAMPLE") == 1 and "e_gv1" in sql and "f_gv1 AS b" in sql
+    sql, _ = sample_query(stmt.select, "duckdb", clause, only={"events"})
+    assert "(bernoulli, 42)" in sql and "(bernoulli, 43)" in sql
 
 
 def test_sampled_query_runs_in_duckdb():

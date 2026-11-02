@@ -15,16 +15,17 @@ from typing import Any
 from . import __version__, guard
 from .config import ConfigError, Connection, Settings
 from .engines import Engine, EngineError, TableInfo, dialect_for, get_engine
-from .extrapolate import Fit, fit_power_law, overall_confidence
+from .extrapolate import BANDS, Fit, fit_power_law, overall_confidence
 from .lint import Finding, _has_aggregation, _outer_select, lint, summarize
-from .sampling import sample_query
+from .sampling import sample_query, sampling_tree
 from .security import policy_for
-from .sqlsafety import Statement, classify
+from .sqlsafety import Statement, base_tables, classify, table_ref
 from .store import Store
 
 DEFAULT_FRACTIONS = (0.01, 0.03, 0.1)
 SMALL_DATA_ROWS = 10_000
 SYSTEM_SAMPLING_ROWS = 1_000_000
+FEW_SAMPLED_ROWS = 2_000         # smallest rung reading fewer rows than this -> wider range
 REHEARSAL_RUNG_TIMEOUT_S = 300.0
 
 WORKFLOW = ("1 gulliver_inspect (what is big?)  2 gulliver_preflight (cost + lint)  "
@@ -291,6 +292,37 @@ def _choose_sample_tables(infos: dict[str, TableInfo], statement: Statement, mod
     return {ref}, largest_rows
 
 
+def _occurrence_seed(seed: int, occurrence: int) -> int:
+    """Each occurrence of a table gets its own seed. With one seed, two occurrences of a table hold the same
+    rows, every row meets itself in a self-join, and the small rungs come out too big (the fit then
+    underestimates the full run)."""
+    return seed + 7919 * occurrence
+
+
+def _lower_confidence(fit: Fit, to: str | None = None) -> None:
+    """Lower a fit's confidence one level (or to `to`) and widen its range to match."""
+    order = ["low", "medium", "high"]
+    if fit.value is None or fit.confidence not in order:
+        return
+    target = to or order[max(0, order.index(fit.confidence) - 1)]
+    if order.index(target) >= order.index(fit.confidence):
+        return
+    fit.confidence = target
+    lo, hi = BANDS[target]
+    fit.low, fit.high = fit.value * lo, fit.value * hi
+
+
+def _repeated_tables(statement: Statement, dialect: str, only: set[str] | None) -> dict[str, int]:
+    """Sampled tables that the query reads more than once (self-joins, IN/EXISTS on the same table,
+    a CTE used twice), with how often."""
+    counts: dict[str, int] = {}
+    for table in base_tables(sampling_tree(statement.select, dialect, only), dialect):
+        ref = table_ref(table, dialect)
+        if only is None or ref.lower() in only:
+            counts[ref] = counts.get(ref, 0) + 1
+    return {ref: n for ref, n in counts.items() if n > 1}
+
+
 def rehearse(settings: Settings, sql: str, connection: str | None = None,
              fractions: list[float] | None = None, sample: str = "largest", method: str = "auto",
              seed: int = 42, progress: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
@@ -344,8 +376,15 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
             return result
 
         methods = engine.supported_methods()
+        repeated = _repeated_tables(statement, dialect, only)
         if method == "auto":
-            chosen = "system" if ("bernoulli" not in methods or (largest_rows or 0) >= SYSTEM_SAMPLING_ROWS) else "bernoulli"
+            # Block (system) samples are cheap but lumpy, and two lumpy samples of one table make a join
+            # very noisy. A table read more than once is read in full anyway (or sampled twice), so take
+            # the row-level sample there.
+            # On local DuckDB a row-level sample costs only a local scan, and DuckDB's vector-sized system
+            # samples were measured to miss the range on plain scans and key joins, so take bernoulli there.
+            big = (largest_rows or 0) >= SYSTEM_SAMPLING_ROWS and engine.name != "duckdb"
+            chosen = "system" if ("bernoulli" not in methods or (big and not repeated)) else "bernoulli"
         elif method in methods:
             chosen = method
         else:
@@ -367,7 +406,9 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
 
         for fraction in fracs:
             sampled_sql, sampled_tables = sample_query(
-                statement.select, dialect, lambda ref, f=fraction: engine.sample_clause(f, seed, chosen), only)
+                statement.select, dialect,
+                lambda ref, occ, f=fraction: engine.sample_clause(f, _occurrence_seed(seed, occ), chosen),
+                only, first_only=(sample == "largest"))
             rung_cost = None
             if engine.billed:
                 try:
@@ -452,6 +493,7 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
     # (saturate) as the data grows. A power law misses that; cap it with what we observed and the planner.
     rows_fit = by_name["output_rows"]
     outer = _outer_select(statement.select)
+    capped = False
     if outer is not None and _has_aggregation(outer) and rows_fit.value is not None:
         observed = max(r["output_rows"] for r in rungs)
         cap = max(observed, full_estimate.rows or 0)
@@ -459,8 +501,32 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
             rows_fit.value = float(cap)
             rows_fit.low = float(observed)
             rows_fit.high = float(cap) * 2
+            capped = True
             rows_fit.notes.append("Grouped result: group counts saturate, so the prediction is capped by the "
                                   "largest rung and the planner estimate.")
+
+    if repeated:
+        listed = ", ".join(f"{ref} ({n}x)" for ref, n in repeated.items())
+        if sample == "largest":
+            rows_fit.notes.append(f"Read more than once: {listed}. Only the first occurrence is sampled; the others "
+                                  "are read in full on every rung, so the output grows ~linearly and stays unbiased.")
+        else:
+            # Each side is sampled independently, so a join between them grows with fraction^2: the sampling
+            # noise of both sides multiplies, and the fit extrapolates 100x from the 10% rung instead of 10x.
+            rows_fit.notes.append(f"Read more than once: {listed}. Every occurrence is sampled with its own seed, "
+                                  "so a join between them grows with fraction^2 (exponent ~2) and the noise of both "
+                                  "samples multiplies; the default --sample largest gives a tighter range.")
+            for fit in (rows_fit, runtime_fit):
+                _lower_confidence(fit, "low")
+
+    sampled_rows = (largest_rows or 0) * rungs[0]["fraction"]
+    # flat or capped (grouped) results need few rows; growing ones do not
+    flat = capped or (rows_fit.exponent is not None and rows_fit.exponent < 0.3)
+    if largest_rows and sampled_rows < FEW_SAMPLED_ROWS and not flat:
+        rows_fit.notes.append(f"The smallest rung read only about {sampled_rows:,.0f} rows of the sampled table; "
+                              "with so few rows a skewed key makes the curve noisy, so the range is wider.")
+        for fit in (rows_fit, runtime_fit):
+            _lower_confidence(fit)
 
     predictions = {f.metric: f.as_dict() for f in fits}
     # money: exact dry-run bytes beat extrapolated bytes; otherwise use the engine's cost model
@@ -493,6 +559,10 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
     if stopped:
         warn.append("ladder stopped early: " + stopped)
     out_rows = by_name["output_rows"].value
+    if out_rows and largest_rows and out_rows > 2 * largest_rows:
+        warn.append(f"the query multiplies rows: about {out_rows:,.0f} output rows from at most {largest_rows:,} "
+                    f"input rows per table ({out_rows / largest_rows:,.0f}x). Check the join keys: a join on a "
+                    "non-unique key matches every pair.")
     if out_rows and out_rows > budget.max_output_rows:
         warn.append(f"the full result has about {out_rows:,.0f} rows; only {budget.max_output_rows} come back as a "
                     "preview. Aggregate if you need all of it.")

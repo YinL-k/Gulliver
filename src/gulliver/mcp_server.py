@@ -181,7 +181,10 @@ def build_server(toolset: str | None = None) -> Any:
         fractions: Annotated[list[float] | None, Field(description="Sample sizes between 0 and 1. "
                                                                    "Default [0.01, 0.03, 0.1].")] = None,
         sample: Annotated[Literal["largest", "all"], Field(description="Sample only the largest table (default, "
-                                                                       "keeps joins honest) or every table.")] = "largest",
+                                                                       "keeps joins honest; in a self-join only its "
+                                                                       "first occurrence) or every table and "
+                                                                       "occurrence with its own seed (cheaper, "
+                                                                       "rougher for joins).")] = "largest",
         method: Annotated[Literal["auto", "system", "bernoulli"],
                           Field(description="Sampling method. auto picks block sampling for big tables.")] = "auto",
         ctx: native.Context = None,

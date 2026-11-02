@@ -10,6 +10,12 @@
   connection in `gulliver.toml` to open them, or `sandbox = false` to turn the engine sandbox off (the parser still
   checks). SELECTs that call side-effect, dynamic-SQL or file functions are now refused (GS001-GS004);
   `allow_functions` lifts that per connection.
+- **Self-join rehearsals changed, and are now right.** When a query reads the sampled table more than once (a
+  self-join, `IN (SELECT ...)` on the same table, a CTE used twice), only the first occurrence is sampled and the
+  others are read in full, and `--method auto` uses bernoulli on DuckDB. Before, both sides held the same sample, and
+  the demo self-join was predicted 2-5x too low and outside its range. Now five seeds predict 252M-257M rows against
+  254,966,150 real ones. A join that multiplies rows now shows the warning "the query multiplies rows" instead of an
+  exponent above 1.3 (`--sample all` still shows the exponent). Rungs read more data, so rehearsals take longer.
 
 ### Security
 

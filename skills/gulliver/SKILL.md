@@ -19,8 +19,8 @@ available; otherwise the CLI `gulliver <command> --json` returns the same JSON.
    Every result has `status` and `next_step`; follow `next_step`. When the result has `autofix`, switch to
    `autofix.fixed_sql`: it returns exactly the same rows and avoids the lint problem.
 4. **Rehearse when asked or unsure.** `gulliver_rehearse` runs the query on 1%, 3% and 10% samples of the
-   largest table and predicts the full run with a range. Look at `prediction.*.exponent`: above 1.3 means the
-   query grows faster than the data (usually a join that multiplies rows). Fix that before running.
+   largest table and predicts the full run with a range. A warning "the query multiplies rows" (or an exponent
+   above 1.3) means a join matches far more pairs than you meant. Fix that before running.
 5. **Run.** `gulliver_run` with the same SQL. If it says `needs_approval`, tell the human the receipt id and
    that they approve with `gulliver approve <id>` (or in the MCP client, when they turned that on). You cannot
    approve yourself, and you should not try to split or disguise a query to get under a limit: the limits are
