@@ -262,6 +262,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-rows", type=int)
     p.add_argument("--max-change", type=float, help="Max %% row-count change since the last check")
 
+    from .review import add_arguments as review_arguments
+
+    review_arguments(sub.add_parser("review", help="PR gate: lint, change type, downstream impact and cost of the "
+                                                   "SQL models a branch changes (exit code 2 = do not merge)"))
+
     p = sub.add_parser("tools", help="Print tool definitions for MCP, OpenAI or Gemini function calling")
     p.add_argument("--format", choices=["mcp", "openai", "gemini"], default="mcp")
 
@@ -332,6 +337,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "lineage":
                 return _emit(features.lineage_overview(args.models, args.manifest, dialect), args.json)
             return _emit(features.impact(args.target, args.models, args.manifest, dialect), args.json)
+        if args.command == "review":
+            from .review import cli as review_cli
+
+            return review_cli(args)
         if args.command == "translate" and not args.check:
             from . import features
 
