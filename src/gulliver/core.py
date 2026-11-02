@@ -8,7 +8,7 @@ The CLI and the MCP server are thin wrappers around these functions.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -275,15 +275,17 @@ def _choose_sample_tables(infos: dict[str, TableInfo], statement: Statement, mod
 
 def rehearse(settings: Settings, sql: str, connection: str | None = None,
              fractions: list[float] | None = None, sample: str = "largest", method: str = "auto",
-             seed: int = 42) -> dict[str, Any]:
+             seed: int = 42, progress: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
+    """`progress(done, total, message)` is called after each rung (the MCP server turns it into notifications)."""
     try:
-        return _rehearse(settings, sql, connection, fractions, sample, method, seed)
+        return _rehearse(settings, sql, connection, fractions, sample, method, seed, progress)
     except (EngineError, ConfigError) as exc:
         return _error(str(exc))
 
 
 def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: list[float] | None,
-              sample: str, method: str, seed: int) -> dict[str, Any]:
+              sample: str, method: str, seed: int,
+              progress: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
     budget = settings.budget
     store = _store(settings)
     conn = settings.connection(connection)
@@ -370,6 +372,8 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
                                 "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4)})
             rungs.append({"fraction": fraction, "elapsed_s": round(res.elapsed_s, 4), "output_rows": res.rows,
                           "bytes": res.bytes_processed, "cost_usd": cost, "sampled_tables": sampled_tables})
+            if progress is not None:
+                progress(len(rungs), len(fracs), f"{fraction:.0%} sample: {res.rows:,} rows in {res.elapsed_s:.2f}s")
 
     if not rungs:
         result.update(status="error", error=f"No rung could run: {stopped}", lint=[f.as_dict() for f in findings],

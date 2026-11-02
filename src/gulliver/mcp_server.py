@@ -14,6 +14,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from . import __version__, core
+from . import mcp_native as native
 from .config import ConfigError, load_settings
 
 try:  # mcp >= 2
@@ -57,7 +58,7 @@ def _settings():
 
 def _guard(fn, *args, **kwargs) -> dict[str, Any]:
     try:
-        return fn(_settings(), *args, **kwargs)
+        return native.typed(fn(_settings(), *args, **kwargs))
     except ConfigError as exc:
         return {"status": "error", "error": str(exc),
                 "next_step": "Ask the human to fix gulliver.toml or the GULLIVER_* environment variables."}
@@ -72,9 +73,12 @@ CONNECTION = Annotated[str | None, Field(description="Connection name from gulli
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 RUNS_QUERIES = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=False)
 GATED_RUN = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+GATED_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False)
+ToolResult = native.ToolResult  # outputSchema: typed status + next_step, other fields allowed
 
 
-def build_server() -> Any:
+def build_server(toolset: str | None = None) -> Any:
+    """toolset: all (default), core, pipeline, or a comma list of those and tool names (see mcp_native)."""
     import inspect
 
     extra = {"version": __version__} if "version" in inspect.signature(_Server.__init__).parameters else {}
@@ -82,7 +86,7 @@ def build_server() -> Any:
 
     @server.tool(name="gulliver_status", annotations=READ_ONLY,
                  description="Show connections, budget limits and money spent today. Call this first.")
-    def gulliver_status() -> dict[str, Any]:
+    def gulliver_status() -> ToolResult:
         return _guard(core.status)
 
     @server.tool(name="gulliver_inspect", annotations=READ_ONLY,
@@ -93,7 +97,7 @@ def build_server() -> Any:
                                                        "Omit to list tables.")] = None,
         connection: CONNECTION = None,
         limit: Annotated[int, Field(description="Max tables to list.", ge=1, le=200)] = 25,
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         return _guard(core.inspect, connection=connection, table=table, limit=limit)
 
     @server.tool(name="gulliver_lint", annotations=READ_ONLY,
@@ -103,7 +107,7 @@ def build_server() -> Any:
         sql: SQL,
         dialect: Annotated[Literal["duckdb", "postgres", "bigquery", "snowflake"],
                            Field(description="SQL dialect.")] = "duckdb",
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         try:
             return core.lint_sql(sql, dialect)
         except Exception as exc:
@@ -123,7 +127,7 @@ def build_server() -> Any:
                                                                   "rows. all: also result-changing rewrites.")] = "safe",
         limit: Annotated[int | None, Field(description="Row limit to add in mode 'all' when the result is "
                                                        "unbounded.", ge=1)] = None,
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         from .fixer import fix
 
         return _guard(fix, sql, connection=connection, dialect=dialect, mode=mode, limit=limit)
@@ -131,14 +135,14 @@ def build_server() -> Any:
     @server.tool(name="gulliver_preflight", annotations=READ_ONLY,
                  description="Estimate bytes, rows and money for a query WITHOUT running it, plus scale lint and the "
                              "budget gate. Always call before gulliver_run.")
-    def gulliver_preflight(sql: SQL, connection: CONNECTION = None) -> dict[str, Any]:
+    def gulliver_preflight(sql: SQL, connection: CONNECTION = None) -> ToolResult:
         return _guard(core.preflight, sql, connection=connection)
 
     @server.tool(name="gulliver_rehearse", annotations=RUNS_QUERIES,
                  description="Run the query on small samples (default 1%, 3%, 10% of the largest table), measure "
                              "runtime/rows/bytes and predict the full run with a confidence range. Costs a fraction "
                              "of the full run. Never writes data.")
-    def gulliver_rehearse(
+    async def gulliver_rehearse(
         sql: SQL,
         connection: CONNECTION = None,
         fractions: Annotated[list[float] | None, Field(description="Sample sizes between 0 and 1. "
@@ -147,21 +151,29 @@ def build_server() -> Any:
                                                                        "keeps joins honest) or every table.")] = "largest",
         method: Annotated[Literal["auto", "system", "bernoulli"],
                           Field(description="Sampling method. auto picks block sampling for big tables.")] = "auto",
-    ) -> dict[str, Any]:
-        return _guard(core.rehearse, sql, connection=connection, fractions=fractions, sample=sample, method=method)
+        ctx: native.Context = None,
+    ) -> ToolResult:
+        return await native.rehearse_tool(_guard, ctx, sql=sql, connection=connection, fractions=fractions,
+                                          sample=sample, method=method)
 
-    @server.tool(name="gulliver_run", annotations=GATED_RUN,
+    run_annotations = GATED_WRITE if native.any_write_connection(_settings) else GATED_RUN
+
+    @server.tool(name="gulliver_run", annotations=run_annotations,
                  description="Run the full query inside the budget. Returns a preview of rows plus totals. May "
                              "answer needs_rehearsal or needs_approval instead of running.")
-    def gulliver_run(
+    async def gulliver_run(
         sql: SQL,
         connection: CONNECTION = None,
         max_rows: Annotated[int | None, Field(description="Rows to return as preview (capped by the budget).",
                                               ge=0)] = None,
         allow_write: Annotated[bool, Field(description="Needed for CREATE/INSERT ... SELECT; the connection must "
                                                        "also allow writes.")] = False,
-    ) -> dict[str, Any]:
-        return _guard(core.run, sql, connection=connection, max_rows=max_rows, allow_write=allow_write)
+        ctx: native.Context = None,
+        probe: native.Probe = None,  # filled by the server (approval in the client), not an agent argument
+        answer: native.Answer = None,  # the human's answer to the approval form, not an agent argument
+    ) -> ToolResult:
+        return await native.run_tool(_guard, ctx, sql=sql, connection=connection, max_rows=max_rows,
+                                     allow_write=allow_write, probe=probe, answer=answer)
 
     @server.tool(name="gulliver_receipt", annotations=READ_ONLY,
                  description="Get a receipt (proof) of a preflight, rehearsal or run, as markdown for a human or "
@@ -169,10 +181,11 @@ def build_server() -> Any:
     def gulliver_receipt(
         receipt_id: Annotated[str, Field(description="receipt_id from an earlier result, or 'latest'.")] = "latest",
         format: Annotated[Literal["markdown", "json"], Field(description="Output format.")] = "markdown",
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         return _guard(core.get_receipt, receipt_id, fmt=format)
 
     _register_feature_tools(server)
+    native.install(server, _guard, _settings, toolset)  # resources, prompts, --toolset
     return server
 
 
@@ -195,7 +208,7 @@ def _register_feature_tools(server: Any) -> None:
         models_dir: MODELS = None,
         manifest: MANIFEST = None,
         dialect: DIALECT = "duckdb",
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         try:
             if not target:
                 return features.lineage_overview(models_dir, manifest, dialect)
@@ -212,7 +225,7 @@ def _register_feature_tools(server: Any) -> None:
         models_dir: MODELS = None,
         manifest: MANIFEST = None,
         save: Annotated[bool, Field(description="Accept the current schema as the new snapshot.")] = False,
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         return _guard(features.drift, connection=connection, models_dir=models_dir, manifest=manifest, save=save)
 
     @server.tool(name="gulliver_translate", annotations=READ_ONLY,
@@ -224,7 +237,7 @@ def _register_feature_tools(server: Any) -> None:
         to_dialect: DIALECT,
         from_dialect: DIALECT = "duckdb",
         connection: CONNECTION = None,
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         if connection:
             return _guard(features.translate, sql, to_dialect, from_dialect, connection)
         return features.translate(None, sql, to_dialect, from_dialect)
@@ -240,7 +253,7 @@ def _register_feature_tools(server: Any) -> None:
         connection: CONNECTION = None,
         right_connection: Annotated[str | None, Field(description="Connection for the right side, if different.")] = None,
         columns: COLS = None,
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         return _guard(features.diff, left, right, key, connection=connection, right_connection=right_connection,
                       columns=columns)
 
@@ -255,7 +268,7 @@ def _register_feature_tools(server: Any) -> None:
         unique_key: COLS = None,
         period: Annotated[str, Field(description="How often it runs / the recompute window, e.g. '1d', '1h'.")] = "1d",
         lookback: Annotated[int, Field(description="Extra periods to recompute for late data.", ge=0)] = 1,
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         return _guard(features.incremental, sql, connection=connection, time_column=time_column,
                       unique_key=unique_key, period=period, lookback=lookback)
 
@@ -276,14 +289,14 @@ def _register_feature_tools(server: Any) -> None:
         min_rows: Annotated[int | None, Field(description="Fail when fewer rows.", ge=0)] = None,
         max_change_pct: Annotated[float | None, Field(description="Fail when the row count moved more than this "
                                                                   "percent since the last check.", ge=0)] = None,
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         return _guard(features.check, target, connection=connection, where=where, unique=unique, not_null=not_null,
                       accepted=accepted, ranges=ranges, fresh=fresh, min_rows=min_rows, max_change_pct=max_change_pct)
 
 
-def tool_schemas() -> list[dict[str, Any]]:
+def tool_schemas(toolset: str | None = None) -> list[dict[str, Any]]:
     """The MCP tool list as plain dicts: name, description, inputSchema."""
-    server = build_server()
+    server = build_server(toolset)
     tools = asyncio.run(server.list_tools())
     out = []
     for tool in tools:
@@ -316,9 +329,9 @@ def _flatten_nullable(schema: Any) -> Any:
     return schema
 
 
-def export_tools(fmt: str = "mcp") -> Any:
+def export_tools(fmt: str = "mcp", toolset: str | None = None) -> Any:
     """Tool definitions for other function-calling APIs (same source as the MCP server)."""
-    tools = tool_schemas()
+    tools = tool_schemas(toolset)
     if fmt == "mcp":
         return tools
     if fmt == "openai":
@@ -338,6 +351,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--http", action="store_true", help="Serve Streamable HTTP instead of stdio")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--toolset", default="all",
+                        help="Tools to expose: all (default), core (the 8 query tools), pipeline, or a comma list "
+                             "of those and tool names. Fewer tools = a smaller schema in the agent's context.")
     parser.add_argument("--version", action="version", version=f"gulliver-mcp {__version__}")
     args = parser.parse_args(argv)
     _ARGS.update(config=args.config, dsn=args.dsn)
@@ -346,7 +362,11 @@ def main(argv: list[str] | None = None) -> None:
     except ConfigError as exc:
         print(f"gulliver-mcp: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
-    server = build_server()
+    try:
+        server = build_server(args.toolset)
+    except ValueError as exc:
+        print(f"gulliver-mcp: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
     if not args.http:
         server.run("stdio")
         return
