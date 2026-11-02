@@ -17,7 +17,8 @@ import functools
 import json
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlglot import exp as sqlglot_exp
 
 from . import core
 from .lint import RULES
@@ -110,11 +111,25 @@ def apply_toolset(server: Any, spec: str | None) -> list[str]:
 
 # -- approval through elicitation ---------------------------------------------------------------------------
 class ApprovalForm(BaseModel):
-    """What the human fills in. Accepting the form without ticking `approve` approves nothing."""
+    """What the human fills in. Accepting the form without ticking `approve` approves nothing.
+
+    Validation never fails: a client that sends something odd (a string for `approve`, an over-long note) must
+    not abort gulliver_run, or the agent would get no receipt_id. Only a real `true` approves; the note is cut.
+    """
 
     approve: bool = Field(default=False, title="Approve this run",
                           description="Tick to let the agent run this query now.")
     note: str = Field(default="", title="Note", description="Optional note for the receipt.", max_length=500)
+
+    @field_validator("approve", mode="before")
+    @classmethod
+    def _only_true_approves(cls, value: Any) -> bool:
+        return value is True
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _short_note(cls, value: Any) -> str:
+        return ("" if value is None else str(value))[:500]
 
 
 def client_can_elicit(ctx: Any) -> bool:
@@ -138,12 +153,36 @@ def client_name(ctx: Any) -> str | None:
         return None
 
 
+SHOWN_SQL_MAX = 4000  # longer SQL is not put in a form: the human must see all of what they approve
+
+# Why the runaway guard asks for a human (it is lifted by an approval of this query, see runaway.py).
+_RUNAWAY_WHY = {
+    "velocity": "This agent is spending fast: over the velocity limit {velocity} within {window:g} minutes.",
+    "repeat": "This exact query already ran several times recently and Gulliver cannot tell whether the data "
+              "changed.",
+}
+_RUNAWAY_LIFTED_BY_APPROVAL = ("velocity", "repeat", "loop")  # an approval restarts the count and lifts velocity
+
+
+def _runaway_precheck(settings: Any, pre: dict[str, Any], conn: Any, cost: float | None) -> dict[str, Any]:
+    """The runaway guard's answer for this run as it stands (no approval yet). Side-effect free: no receipt is
+    saved and the engine is closed again; at most it reads table metadata for the data-version signal."""
+    from . import runaway
+
+    with core._engine(settings, conn.name) as (_, engine):
+        return runaway.check(settings, engine, pre["sql"], connection=conn.name, sql_hash=pre["sql_hash"],
+                             kind="run", cost=cost, bytes_=(pre.get("estimate") or {}).get("bytes"),
+                             receipt_id="probe")
+
+
 def approval_probe(settings: Any, sql: str, connection: str | None = None,
                    allow_write: bool = False) -> dict[str, Any] | None:
-    """Would gulliver_run stop at needs_approval? Mirrors core._run's gates in the same order; reads no data.
+    """Would gulliver_run stop at needs_approval? Mirrors core._run's gates in the same order, including the
+    runaway guard; reads no table data.
 
     Returns None when the run would not need approval (it runs, or another gate stops it first), so the human
-    is only asked about runs that their approval would actually unblock.
+    is only asked about runs that their approval would actually unblock. Returns {"ask": False, "reason": ...}
+    when the run needs approval but Gulliver will not ask in the client, and says why.
     """
     conn = settings.connection(connection)
     budget = settings.budget
@@ -166,15 +205,34 @@ def approval_probe(settings: Any, sql: str, connection: str | None = None,
     runtime = (pred.get("runtime_s") or {}).get("value")
     if runtime is not None and runtime > budget.max_runtime_s:
         return None
-    if cost is None or cost <= budget.approval_over_usd or cost > budget.max_query_usd:
+    if cost is not None and (cost > budget.max_query_usd or store.spent_today()["usd"] + cost > budget.day_usd):
         return None
-    if store.spent_today()["usd"] + cost > budget.day_usd:
-        return None
-    if store.find_approval(pre["sql_hash"], conn.name, cost=cost) is not None:
-        return None
-    probe = {"ask": True, "cost_usd": cost, "sql_hash": pre["sql_hash"], "connection": conn.name,
-             "rehearsal_id": (rehearsal or {}).get("receipt_id")}
-    probe["message"] = approval_message(pre, settings, cost, rehearsal)
+    needs_cost_approval = (cost is not None and cost > budget.approval_over_usd
+                           and store.find_approval(pre["sql_hash"], conn.name, cost=cost) is None)
+
+    # core.run calls the runaway guard after the cost gate, so it applies with or without the approval
+    loop = _runaway_precheck(settings, pre, conn, cost)
+    reason = (loop.get("extra") or {}).get("reason")
+    why = ["An agent wants to run a query that costs more than your auto-approve limit."] if needs_cost_approval else []
+    if loop["status"] == "block" and reason not in _RUNAWAY_LIFTED_BY_APPROVAL:
+        if not needs_cost_approval:
+            return None  # blocked anyway: the run answers block, not needs_approval
+        return {"ask": False, "reason": f"An approval would not let this run go ahead ({reason}), so Gulliver did "
+                                        "not ask the human: " + loop["next_step"]}
+    if loop["status"] == "needs_approval":
+        why.append(_RUNAWAY_WHY.get(str(reason), "The runaway guard asks for a human for this query.").format(
+            velocity=core._fmt_usd(budget.velocity_usd), window=budget.velocity_window_min))
+    elif not needs_cost_approval:
+        return None  # it runs (or the loop guard blocks it) without an approval
+
+    probe: dict[str, Any] = {"ask": True, "cost_usd": cost, "sql_hash": pre["sql_hash"], "connection": conn.name,
+                             "rehearsal_id": (rehearsal or {}).get("receipt_id")}
+    message = approval_message(pre, settings, cost, rehearsal, why=why)
+    if message is None:
+        return {"ask": False, "reason": f"The SQL is too long to show in full in an approval form (over "
+                                        f"{SHOWN_SQL_MAX:,} characters), so Gulliver did not ask in the client. "
+                                        "The human can read it in the receipt and approve on the command line."}
+    probe["message"] = message
     return probe
 
 
@@ -187,14 +245,46 @@ def _pred_text(pred: dict[str, Any] | None, fmt: Any) -> str | None:
     return text
 
 
-def approval_message(pre: dict[str, Any], settings: Any, cost: float, rehearsal: dict[str, Any] | None) -> str:
-    """The text the human sees. Deterministic for the same SQL and state, so a retried request is not re-asked."""
+def _statement_summary(pre: dict[str, Any]) -> tuple[str, str | None]:
+    """(what the statement does, its SQL without comments) from the parsed statement, never from its text."""
+    from .engines import dialect_for
+    from .sqlsafety import classify
+
+    stmt = classify(pre.get("sql") or "", dialect_for(str(pre.get("engine") or "duckdb")))
+    tree = stmt.tree
+    shown = tree.sql(dialect=stmt.dialect, comments=False, pretty=True) if tree is not None else None
+    tables = ", ".join(stmt.tables) or "no tables"
+    if stmt.kind != "write":
+        return f"READ-ONLY query (reads {tables}).", shown
+    if isinstance(tree, sqlglot_exp.Create):
+        verb = "CREATE OR REPLACE" if tree.args.get("replace") else "CREATE"
+        verb += f" {str(tree.args.get('kind') or 'TABLE').upper()}"
+        effect = " It replaces that object and everything in it." if tree.args.get("replace") else ""
+    else:
+        verb = "INSERT OVERWRITE INTO" if tree is not None and tree.args.get("overwrite") else "INSERT INTO"
+        effect = " It replaces the rows in that table." if "OVERWRITE" in verb else " It adds rows to that table."
+    return f"WRITE: {verb} {stmt.target or '?'} (reads {tables}).{effect}", shown
+
+
+def approval_message(pre: dict[str, Any], settings: Any, cost: float | None, rehearsal: dict[str, Any] | None,
+                     why: list[str] | None = None) -> str | None:
+    """The text the human sees, or None when the SQL is too long to show in full.
+
+    The statement kind and write target come first, from the parsed statement; the SQL is shown re-rendered
+    without comments, so text inside the SQL cannot hide or imitate them. Deterministic for the same SQL and
+    state, so a retried request is not re-asked.
+    """
     budget = settings.budget
     estimate = pre.get("estimate") or {}
+    summary, shown = _statement_summary(pre)
+    if shown is None or len(shown) > SHOWN_SQL_MAX:
+        return None
     lines = [
         "Gulliver: approve this query?",
         "",
-        "An agent wants to run a query that costs more than your auto-approve limit.",
+        summary,
+        "",
+        *(why or ["An agent wants to run a query that costs more than your auto-approve limit."]),
         f"- Connection: {pre.get('connection')} ({pre.get('engine')})",
         f"- Cost: {core._fmt_usd(cost)} (auto-approve limit {core._fmt_usd(budget.approval_over_usd)}, "
         f"hard limit {core._fmt_usd(budget.max_query_usd)})",
@@ -210,9 +300,7 @@ def approval_message(pre: dict[str, Any], settings: Any, cost: float, rehearsal:
         if parts:
             lines.append(f"- Rehearsal predicts: {'; '.join(parts)} (confidence {rehearsal.get('confidence')})")
     lines.append(f"- SQL fingerprint: {pre.get('sql_hash')}")
-    sql = pre.get("sql") or ""
-    shown = sql if len(sql) <= 1500 else sql[:1500] + f"\n... ({len(sql) - 1500:,} more characters)"
-    lines += ["", "SQL:", shown, "",
+    lines += ["", "SQL (comments removed):", shown, "", f"Statement: {summary}", "",
               "Only you can approve this; the agent cannot. Tick 'approve' and accept to run it now. The approval "
               "is saved in the receipt and holds for 24 hours for exactly this SQL on this connection."]
     return "\n".join(lines)
@@ -239,16 +327,45 @@ def probe_resolver(sql: str, connection: str | None, allow_write: bool, ctx: Con
         return {"ask": False, "reason": "The MCP client did not declare the elicitation capability, so Gulliver "
                                         "could not ask the human there."}
     try:
-        return approval_probe(settings, sql, connection, allow_write) or {"ask": False}
+        return approval_probe(settings, sql, connection, allow_write) or {
+            "ask": False, "reason": "When Gulliver checked just before the run, it did not need approval, so the "
+                                    "human was not asked (something changed in between)."}
+    except Exception as exc:
+        return {"ask": False, "reason": f"Gulliver could not prepare the approval form ({type(exc).__name__}), so "
+                                        "the human was not asked in the client."}
+
+
+class AskFailed(BaseModel):
+    """The client answered the approval form with an error (closed, timed out, could not show it)."""
+
+    error: str
+
+
+def _uses_input_required(ctx: Any) -> bool:
+    """True on the 2026-07-28 round trip (the framework batches the question); False on the mid-call request."""
+    try:
+        version = ctx.protocol_version
     except Exception:
-        return {"ask": False}
+        return False
+    if not version:
+        return False
+    from mcp_types.version import is_version_at_least
+
+    return is_version_at_least(version, "2026-07-28")
 
 
 if HAS_ELICITATION:
-    def ask_resolver(probe: Annotated[dict[str, Any] | None, Resolve(probe_resolver)]) -> Any:
+    async def ask_resolver(probe: Annotated[dict[str, Any] | None, Resolve(probe_resolver)], ctx: Context) -> Any:
         if not probe or not probe.get("ask"):
             return None
-        return Elicit(probe["message"], ApprovalForm)
+        if _uses_input_required(ctx):
+            return Elicit(probe["message"], ApprovalForm)  # the framework asks in the next round
+        # Mid-call request: ask here, so a client error falls back to needs_approval (with a receipt_id) instead
+        # of failing the whole tools/call.
+        try:
+            return await ctx.elicit(probe["message"], ApprovalForm)
+        except Exception as exc:
+            return AskFailed(error=str(exc)[:200] or type(exc).__name__)
 
     # The two gulliver_run parameters filled by the server (never in the input schema, never from the agent).
     Probe = Annotated[dict[str, Any] | None, Resolve(probe_resolver)]
@@ -261,7 +378,16 @@ else:  # pragma: no cover - mcp 1.x
     Answer = SkipJsonSchema[None]  # type: ignore[misc]
 
 
+def _unwrap_answer(answer: Any) -> Any:
+    """ask_resolver may return the outcome itself (mid-call request); the framework then wraps it as accepted."""
+    if isinstance(answer, AcceptedElicitation) and not isinstance(answer.data, ApprovalForm):
+        return answer.data
+    return answer
+
+
 def _answer_label(answer: Any) -> str:
+    if isinstance(answer, AskFailed):
+        return "error"
     if isinstance(answer, AcceptedElicitation):
         return "accepted without ticking approve"
     action = getattr(answer, "action", None)
@@ -277,6 +403,7 @@ def run_with_approval(settings: Any, sql: str, connection: str | None = None, ma
         return first
     rid = first.get("receipt_id")
     probe = probe if isinstance(probe, dict) else {}
+    answer = _unwrap_answer(answer)
     data = answer.data if isinstance(answer, AcceptedElicitation) else None
     request: dict[str, Any] = {"channel": "elicitation"}
     if not probe.get("ask"):
@@ -287,7 +414,8 @@ def run_with_approval(settings: Any, sql: str, connection: str | None = None, ma
         now = (first.get("gate") or {}).get("cost_for_gate_usd")
         shown = probe.get("cost_usd")
         same = probe.get("sql_hash") == first.get("sql_hash") and probe.get("connection") == first.get("connection")
-        if same and now is not None and shown is not None and now <= shown + 1e-9:
+        no_more = (now is None and shown is None) or (now is not None and shown is not None and now <= shown + 1e-9)
+        if same and no_more:
             Store(settings.state_dir).approve(rid, note=data.note, channel="elicitation", client=client)
             second = core.run(settings, sql, connection=connection, max_rows=max_rows, allow_write=allow_write)
             second["approved_receipt_id"] = rid
@@ -296,6 +424,8 @@ def run_with_approval(settings: Any, sql: str, connection: str | None = None, ma
                                               f"shown, {core._fmt_usd(now)} now); nothing was approved.")
     else:
         request["answer"] = _answer_label(answer)
+        if isinstance(answer, AskFailed):
+            request["reason"] = f"The client could not show the approval form: {answer.error}"
     first["approval_request"] = request
     if request["answer"] in ("declined", "cancelled", "accepted without ticking approve"):
         first["next_step"] = (f"The human did not approve this run in the client ({request['answer']}). Do not retry "

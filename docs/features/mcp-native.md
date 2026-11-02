@@ -10,7 +10,7 @@ load fewer tool schemas.
   auto-approve limit to avoid it, which is the opposite of what the limit is for.
 - Clients that never read AGENTS.md do not know the loop (inspect, preflight, rehearse, run, receipt).
 - Agents call `gulliver_inspect` again and again for the same context.
-- All 14 tool schemas take about 20 KB of the agent's context, even when the task only needs the query loop.
+- All 16 tool schemas take about 25 KB of the agent's context, even when the task only needs the query loop.
 - A rehearsal on a slow warehouse looks like a hung call.
 
 ### Approval in the MCP client (elicitation), opt-in
@@ -22,23 +22,40 @@ A human turns it on in `gulliver.toml`. There is no environment variable and no 
 channel = "elicitation"   # default "cli": a human runs `gulliver approve <receipt_id>`
 ```
 
-When `gulliver_run` would answer `needs_approval`, the server first sends the client a form (MCP elicitation).
+When `gulliver_run` would answer `needs_approval` (over the auto-approve limit, or the runaway guard's
+velocity or repeat check), the server first sends the client a form (MCP elicitation).
 The client shows it to its user:
 
 ```text
 Gulliver: approve this query?
 
+READ-ONLY query (reads events, users).
+
 An agent wants to run a query that costs more than your auto-approve limit.
+This agent is spending fast: over the velocity limit $2.00 within 10 minutes.
 - Connection: local (duckdb)
 - Cost: $3.84 (auto-approve limit $1.00, hard limit $100.00)
 - Scan: 3.7 MB (exact estimate)
 - SQL fingerprint: bdd676276a901c63
 
-SQL:
-select u.country, count(*) as n from events e join users u on e.user_id = u.user_id where e.event_type = 'buy' group by 1
+SQL (comments removed):
+SELECT
+  u.country,
+  COUNT(*) AS n
+FROM events AS e
+...
+
+Statement: READ-ONLY query (reads events, users).
 
 Only you can approve this; the agent cannot. Tick 'approve' and accept to run it now. ...
 ```
+
+The first line under the title says what the statement does, taken from the parsed statement: `READ-ONLY query`,
+or for a write the verb and the target, e.g. `WRITE: CREATE OR REPLACE TABLE users (reads events, users). It
+replaces that object and everything in it.` It is repeated under the SQL. The SQL is shown re-rendered from the
+parsed statement with its comments removed, so a comment cannot hide the statement or add lines that look like
+Gulliver's. The SQL is always shown in full: when it is longer than 4,000 characters, Gulliver does not ask in
+the client at all (see below).
 
 With a rehearsal on file, the form also shows the predicted runtime, rows and cost range with the confidence.
 The form has two fields: `approve` (a checkbox, off by default) and an optional `note`.
@@ -49,8 +66,15 @@ The form has two fields: `approve` (a checkbox, off by default) and an optional 
 - **Decline, cancel, or accept without ticking approve**: the answer is `needs_approval` as before, with
   `approval_request: {"channel": "elicitation", "answer": "declined"}` saved in the receipt, and a `next_step`
   that tells the agent not to retry the same SQL. `gulliver approve <id>` still works.
+- **The client answers the form with an error** (dialog closed, timed out, cannot render it): `needs_approval`
+  with `approval_request.answer: "error"` and the client's message as the reason, saved in the receipt.
+  Odd form content never fails the call: only a real `true` for `approve` approves, and a note over 500
+  characters is cut.
 - **The client cannot show forms** (it did not declare the elicitation capability): `needs_approval`, with
   `approval_request.answer: "not asked"` and the reason.
+- **Not asked for another reason**: `answer: "not asked"` with a reason that says why, e.g. the SQL is too long
+  to show in full, or an approval would not let the run go ahead (the session or agent budget of the runaway
+  guard is used up).
 - **The cost went up between the question and the run**: nothing is approved (`answer: "stale"`).
 
 ```json
@@ -66,7 +90,9 @@ The form has two fields: `approve` (a checkbox, off by default) and an optional 
 ```
 
 The human is only asked about runs that their approval would unblock: a run that is blocked, needs a rehearsal
-first, is over the per-query or daily limit, or is cheap enough to run anyway never shows a form.
+first, is over the per-query or daily limit, is over a session or agent budget, or is cheap enough to run anyway
+never shows a form. The check before asking runs the same gates as `gulliver_run`, including the runaway guard
+(it reads ledger and table metadata, no table data).
 
 ### Resources
 
@@ -99,14 +125,14 @@ with a message like `1% sample: 4,021 rows in 0.03s`) when the client asks for p
 
 ```bash
 gulliver-mcp --toolset core                  # status, inspect, lint, fix, preflight, rehearse, run, receipt
-gulliver-mcp --toolset pipeline              # status, inspect, receipt + impact, drift, diff, translate, incremental, check, top
+gulliver-mcp --toolset pipeline              # status, inspect, receipt + impact, drift, diff, translate, incremental, check, top, review
 gulliver-mcp --toolset core,gulliver_check   # mix sets and tool names
 gulliver mcp --toolset core                  # same through the main CLI
 gulliver tools --format openai --toolset core
 ```
 
-Sizes measured with mcp 2.3.0 (`tools/list` JSON): all 14 tools 19.8 KB, `core` 9.5 KB, `pipeline` 13.0 KB.
-Input schemas only (`gulliver tools`): 13.9 KB, 6.2 KB and 9.3 KB.
+Sizes measured with mcp 2.3.0 (`tools/list` JSON): all 16 tools 25.6 KB, `core` (8 tools) 10.9 KB, `pipeline`
+(11 tools) 17.8 KB. Input schemas only (`gulliver tools`): 19.2 KB, 7.6 KB and 13.6 KB.
 
 ### Typed output
 
@@ -133,11 +159,14 @@ open schema before; the typed schema adds about 200 bytes per tool.
 - Some clients may answer forms automatically, or let the model answer them. Turn this on only for clients that
   show elicitation forms to a person. The client name in the receipt is self-reported, not a proof of identity.
 - Needs mcp >= 2. With mcp 1.x the server falls back to `needs_approval` (the CLI channel), untested there.
-- With the channel on, each `gulliver_run` does one extra dry estimate before the run (no data read); on the
-  2026-07-28 round trip it is two.
+- With the channel on, each `gulliver_run` does one extra dry estimate and runaway check before the run (no
+  table data read; the data-version signal reads table metadata); on the 2026-07-28 round trip it is two.
 - Progress is best effort: a ladder that stops early ends before `3 of 3`. Cancelling a rehearsal does not yet stop
   the engine job.
 - URL-mode elicitation is not used.
+- On the 2026-07-28 round trip, a client whose form fails aborts the `tools/call` itself (it raises instead of
+  answering), so the server never hears of it and there is no `receipt_id`; the agent gets a client error. Call
+  `gulliver_run` again, or approve on the command line after a `needs_approval` on a client without forms.
 
 ## CHANGELOG
 

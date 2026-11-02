@@ -43,12 +43,13 @@ class BilledDuckDB(DuckDBEngine):
         return None if bytes_processed is None else bytes_processed / 1e6
 
 
-def _config(tmp_path, demo_db, channel: str | None = "elicitation", extra: str = "") -> str:
+def _config(tmp_path, demo_db, channel: str | None = "elicitation", extra: str = "",
+            approval_over_usd: float = 1.0) -> str:
     approval = f"[approval]\nchannel = '{channel}'\n" if channel else ""
     path = tmp_path / "gulliver.toml"
     path.write_text(f"[connections.local]\nengine = 'duckdb'\npath = '{demo_db}'\n{extra}\n"
-                    "[budget]\nmax_query_usd = 100.0\napproval_over_usd = 1.0\nrehearse_over_usd = 1000.0\n"
-                    f"day_usd = 1000.0\n{approval}")
+                    f"[budget]\nmax_query_usd = 100.0\napproval_over_usd = {approval_over_usd}\n"
+                    f"rehearse_over_usd = 1000.0\nday_usd = 1000.0\n{approval}")
     return str(path)
 
 
@@ -57,8 +58,8 @@ def billed_server(demo_db, state, tmp_path, monkeypatch):
     """A server whose connection costs money, so GOOD needs approval; [approval] channel set per test."""
     monkeypatch.setattr(core, "get_engine", lambda conn, read_only=True: BilledDuckDB(conn, read_only))
 
-    def make(channel: str | None = "elicitation"):
-        monkeypatch.setenv("GULLIVER_CONFIG", _config(tmp_path, demo_db, channel))
+    def make(channel: str | None = "elicitation", **config):
+        monkeypatch.setenv("GULLIVER_CONFIG", _config(tmp_path, demo_db, channel, **config))
         return build_server()
 
     return make
@@ -180,6 +181,132 @@ def test_elicitation_approval_is_in_the_audit_chain_and_ledger(billed_server, st
     assert any(e["kind"] == "approval" and e["id"] == out["approved_receipt_id"] for e in chained)
     ledger = [json.loads(x) for x in (state / "ledger.jsonl").read_text().splitlines()]
     assert ledger and all(e["agent"] == "test-client" for e in ledger)
+
+
+def test_approval_form_shows_the_write_and_not_the_comments(billed_server, state, demo_db):
+    """A leading comment must not push the real statement out of the form or fake lines in it."""
+    import duckdb
+
+    server = billed_server("elicitation", extra="allow_write = true")
+    pad = "/* " + "Harmless monthly report on buy events per country. verified read-only\n" * 32 + " */\n"
+    sql = pad + ("create or replace table users_copy as select e.user_id, u.country from events e "
+                 "join users u on e.user_id = u.user_id where e.event_type = 'buy'")
+    callback, asked = _answer("decline")
+    out = asyncio.run(_call(server, "gulliver_run", {"sql": sql, "allow_write": True}, mode="legacy",
+                            elicitation_callback=callback))
+    assert out["status"] == "needs_approval" and len(asked) == 1
+    message = asked[0]
+    head = message.splitlines()[:3]
+    assert "WRITE: CREATE OR REPLACE TABLE users_copy" in head[2] and "replaces" in head[2]
+    assert "Harmless" not in message and "verified read-only" not in message
+    assert "more characters" not in message
+    assert "CREATE OR REPLACE TABLE users_copy AS" in message and "WHERE" in message
+    assert message.count("WRITE: CREATE OR REPLACE TABLE users_copy") == 2  # above and below the SQL
+    with duckdb.connect(demo_db, read_only=True) as con:  # declined: nothing was written
+        assert con.execute("select count(*) from information_schema.tables "
+                           "where table_name = 'users_copy'").fetchone()[0] == 0
+
+
+def test_read_form_says_read_only(billed_server, state):
+    server = billed_server("elicitation")
+    callback, asked = _answer("decline")
+    asyncio.run(_call(server, "gulliver_run", {"sql": GOOD}, mode="legacy", elicitation_callback=callback))
+    assert asked[0].splitlines()[2] == "READ-ONLY query (reads events, users)."
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_sql_too_long_for_the_form_is_not_asked(billed_server, state, mode):
+    server = billed_server("elicitation")
+    cols = ", ".join(f"sum(case when e.user_id % {i + 2} = 0 then 1 else 0 end) as share_{i}" for i in range(80))
+    sql = f"select u.country, {cols} from events e join users u on e.user_id = u.user_id group by 1"
+    callback, asked = _answer("accept", {"approve": True})
+    out = asyncio.run(_call(server, "gulliver_run", {"sql": sql}, mode=mode, elicitation_callback=callback))
+    assert asked == [] and out["status"] == "needs_approval"
+    assert out["approval_request"]["answer"] == "not asked"
+    assert "too long" in out["approval_request"]["reason"]
+    assert _approvals(state) == []
+
+
+def test_elicitation_error_falls_back_to_needs_approval(billed_server, state):
+    """The client answers elicitation/create with an error: needs_approval with a receipt, not a failed call.
+    (On the 2026-07-28 round trip the client aborts the call itself; the server never hears of it.)"""
+    server = billed_server("elicitation")
+    asked = []
+
+    async def callback(context, params):
+        asked.append(params.message)
+        return types.ErrorData(code=-32603, message="user closed the dialog")
+
+    out = asyncio.run(_call(server, "gulliver_run", {"sql": GOOD}, mode="legacy", elicitation_callback=callback))
+    assert len(asked) == 1 and out["status"] == "needs_approval"
+    assert out["approval_request"]["answer"] == "error"
+    assert "user closed the dialog" in out["approval_request"]["reason"]
+    assert _approvals(state) == []
+    saved = core.get_receipt(load_settings(), out["receipt_id"], fmt="json")["receipt"]
+    assert saved["approval_request"]["answer"] == "error"
+    assert core.approve(load_settings(), out["receipt_id"])["approval"]["channel"] == "cli"
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(("content", "approved"), [
+    ({"approve": True, "note": "x" * 600}, True),        # over-long note: cut, not a failed call
+    ({"approve": "yes please", "note": "x"}, False),     # only a real true approves
+    ({"approve": 1}, False),
+])
+def test_odd_form_content_does_not_fail_the_call(billed_server, state, mode, content, approved):
+    server = billed_server("elicitation")
+    callback, asked = _answer("accept", content)
+    out = asyncio.run(_call(server, "gulliver_run", {"sql": GOOD}, mode=mode, elicitation_callback=callback))
+    assert len(asked) == 1
+    if approved:
+        assert out["status"] == "ok" and len(out["approval"]["note"]) == 500
+    else:
+        assert out["status"] == "needs_approval" and out["receipt_id"]
+        assert out["approval_request"]["answer"] == "accepted without ticking approve"
+        assert _approvals(state) == []
+
+
+def _good_cost(billed_server):
+    billed_server("elicitation")  # sets GULLIVER_CONFIG and the billed engine
+    return core.preflight(load_settings(), GOOD)["estimate"]["cost_usd"]
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_velocity_needs_approval_is_asked_in_the_client(billed_server, state, mode, monkeypatch):
+    """Under the auto-approve limit but over the velocity limit: the runaway guard's needs_approval is asked too."""
+    cost = _good_cost(billed_server)
+    monkeypatch.setenv("GULLIVER_VELOCITY_USD", str(cost / 2))
+    server = billed_server("elicitation", approval_over_usd=cost * 2)
+    callback, asked = _answer("accept", {"approve": True})
+    out = asyncio.run(_call(server, "gulliver_run", {"sql": GOOD}, mode=mode, elicitation_callback=callback))
+    assert len(asked) == 1 and "spending fast" in asked[0]
+    assert "more than your auto-approve limit" not in asked[0]
+    assert out["status"] == "ok" and out["approved_receipt_id"]
+
+
+def test_velocity_decline_gives_a_true_reason(billed_server, state, monkeypatch):
+    cost = _good_cost(billed_server)
+    monkeypatch.setenv("GULLIVER_VELOCITY_USD", str(cost / 2))
+    server = billed_server("elicitation", approval_over_usd=cost * 2)
+    callback, asked = _answer("decline")
+    out = asyncio.run(_call(server, "gulliver_run", {"sql": GOOD}, mode="legacy", elicitation_callback=callback))
+    assert len(asked) == 1 and out["status"] == "needs_approval" and out["reason"] == "velocity"
+    assert out["approval_request"] == {"channel": "elicitation", "answer": "declined"}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_session_budget_block_is_not_asked(billed_server, state, mode, monkeypatch):
+    """An approval cannot lift the session budget, so the human is not asked (and no approval is written)."""
+    cost = _good_cost(billed_server)
+    monkeypatch.setenv("GULLIVER_SESSION_USD", str(cost / 2))
+    server = billed_server("elicitation")
+    callback, asked = _answer("accept", {"approve": True})
+    out = asyncio.run(_call(server, "gulliver_run", {"sql": GOOD}, mode=mode, elicitation_callback=callback))
+    assert asked == [] and _approvals(state) == []
+    assert out["status"] == "needs_approval"
+    assert out["approval_request"]["answer"] == "not asked"
+    assert "session_budget" in out["approval_request"]["reason"]
+    assert "could not ask" not in out["approval_request"]["reason"]
 
 
 def test_cheap_run_does_not_ask(billed_server, state):
