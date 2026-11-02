@@ -262,6 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-rows", type=int)
     p.add_argument("--max-change", type=float, help="Max %% row-count change since the last check")
 
+    p = sub.add_parser("selftest", help="Check Gulliver itself: 'security' runs the bypass test set and the sandbox")
+    p.add_argument("suite", choices=["security"])
+    p.add_argument("--corpus", help="Another test set file (TOML, same format as the built-in one)")
+
     p = sub.add_parser("tools", help="Print tool definitions for MCP, OpenAI or Gemini function calling")
     p.add_argument("--format", choices=["mcp", "openai", "gemini"], default="mcp")
 
@@ -339,6 +343,14 @@ def main(argv: list[str] | None = None) -> int:
 
         settings = load_settings(config_path=args.config, dsn=args.dsn)
         conn = args.connection
+        if args.command == "selftest":
+            from . import security
+
+            result = security.selftest(settings, conn, corpus=args.corpus)
+            if not args.json:
+                print(security.render_selftest(result))
+                return EXIT.get(str(result.get("status")), 1)
+            return _emit(result, args.json)
         if args.command in ("snapshot", "drift", "translate", "diff", "incremental", "check"):
             from . import features
 
