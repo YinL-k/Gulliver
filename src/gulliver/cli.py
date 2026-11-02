@@ -169,12 +169,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("table", nargs="?")
     p.add_argument("--limit", type=int, default=25)
 
-    p = sub.add_parser("lint", help="Scale lint only (no database needed)")
-    _add_sql_args(p)
+    p = sub.add_parser("lint", help="Scale lint only (no database needed): one SQL string, or files and folders")
+    p.add_argument("sql", nargs="*", help="SQL text, '-' to read stdin, or .sql files and folders (CI mode)")
+    p.add_argument("-f", "--file", help="Read one SQL statement from a file")
     p.add_argument("--dialect", default=None, help="duckdb, postgres, bigquery or snowflake")
+    p.add_argument("--format", choices=["text", "json", "sarif", "github", "gitlab", "junit"], default=None,
+                   help="Files mode output (default text; --json = json)")
+    p.add_argument("--fail-on", choices=["error", "warn", "info", "never"], default=None,
+                   help="Files mode: exit 2 when a finding is at least this severe (default error, or [lint] fail_on)")
+    p.add_argument("--exclude", action="append", metavar="GLOB", help="Files mode: skip matching paths (repeatable)")
+    p.add_argument("--warn-unused-ignores", action="store_true", help="Files mode: report ignore comments that "
+                                                                      "ignore nothing (GV901)")
+    p.add_argument("--metadata", action="store_true", help="Files mode: read table metadata from the connection "
+                                                           "(partitions for GV004, column types for same-rows fixes)")
+    p.add_argument("-o", "--output", metavar="PATH", help="Files mode: write the report to PATH (e.g. gulliver.sarif)")
+
+    sub.add_parser("rules", help="List the lint rules (id, name, default severity, autofix)")
 
     p = sub.add_parser("fix", help="Rewrite SQL to be cheaper, and say if the rows stay exactly the same")
-    _add_sql_args(p)
+    p.add_argument("sql", nargs="*", help="SQL text, '-' to read stdin, or .sql files and folders with --check/--write")
+    p.add_argument("-f", "--file", help="Read the SQL from a file")
+    p.add_argument("--check", action="store_true", help="Files: exit 2 when a same-rows rewrite exists (CI)")
+    p.add_argument("--write", action="store_true", help="Files: apply same-rows rewrites in place")
     p.add_argument("--dialect", default=None, help="duckdb, postgres, bigquery or snowflake (default: connection's)")
     p.add_argument("--mode", choices=["safe", "all"], default="safe",
                    help="safe: same rows only (default). all: also LIMIT, approx count, UNION ALL, NOT EXISTS")
@@ -297,6 +313,25 @@ def main(argv: list[str] | None = None) -> int:
                 forwarded += ["--http", "--host", args.host, "--port", str(args.port)]
             mcp_main(forwarded)
             return 0
+        if args.command == "rules":
+            from .lint_report import cli_rules
+
+            return cli_rules(args)
+        if args.command in ("lint", "fix"):
+            from . import lint_report
+
+            files_flags = args.command == "lint" and bool(
+                args.format not in (None, "text", "json") or args.fail_on or args.exclude or args.warn_unused_ignores
+                or args.metadata or args.output)
+            if args.command == "fix" and (args.check or args.write):
+                if not args.sql:
+                    raise ValueError("gulliver fix --check/--write needs .sql files or folders")
+                return lint_report.cli_fix(args)
+            if not args.file and lint_report.path_mode(args.sql, files_flags):
+                return lint_report.cli_lint(args) if args.command == "lint" else lint_report.cli_fix(args)
+            if len(args.sql or []) > 1:
+                raise ValueError("Give one SQL statement in quotes, or existing .sql files and folders")
+            args.sql = args.sql[0] if args.sql else None
         if args.command == "lint":
             dialect = args.dialect
             if dialect is None:
