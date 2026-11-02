@@ -29,6 +29,7 @@ RULES = {
     "GV010": "scalar-subquery-in-select",
     "GV011": "window-without-partition",
     "GV012": "not-in-subquery",
+    "GV013": "leading-wildcard-like",
 }
 
 
@@ -247,6 +248,17 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
             add("GV012", "info",
                 "NOT IN (subquery) returns nothing if the subquery has a NULL, and often plans badly.",
                 "Use NOT EXISTS or a LEFT JOIN ... WHERE key IS NULL.")
+            break
+
+    # GV013 LIKE / ILIKE with a leading wildcard
+    for like in tree.find_all(exp.Like, exp.ILike):
+        pattern = like.expression
+        if isinstance(pattern, exp.Literal) and pattern.is_string and pattern.name.startswith("%"):
+            add("GV013", "info",
+                f"{like.sql(dialect=dialect)} starts with a wildcard, so no index or min/max statistics can help: "
+                "it scans every value.",
+                "Filter on another (partition or indexed) column first, or use the engine's full-text / "
+                "n-gram search.")
             break
 
     findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.rule))

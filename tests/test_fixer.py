@@ -31,6 +31,10 @@ def typed(ctype: str = "TIMESTAMP", table: str = "t", column: str = "ts") -> dic
     ("duckdb", "select a from t where year(ts) = 2024", "TIMESTAMP", "ts >= '2024-01-01' AND ts < '2025-01-01'"),
     ("duckdb", "select a from t where date_trunc('month', ts) = '2024-12-01'", "TIMESTAMP",
      "ts >= '2024-12-01' AND ts < '2025-01-01'"),
+    ("duckdb", "select a from t where date_trunc('quarter', ts) = '2024-04-01'", "TIMESTAMP",
+     "ts >= '2024-04-01' AND ts < '2024-07-01'"),
+    ("duckdb", "select a from t where date_trunc('quarter', ts) = '2024-10-01'", "DATE",
+     "ts >= '2024-10-01' AND ts < '2025-01-01'"),
     ("duckdb", "select a from t where date(ts) > '2024-01-01'", "TIMESTAMP", "ts >= '2024-01-02'"),
     ("duckdb", "select a from t where date(ts) <= '2024-02-29'", "TIMESTAMP", "ts < '2024-03-01'"),
     ("duckdb", "select a from t where date(ts) < '2024-01-01'", "TIMESTAMP", "ts < '2024-01-01'"),
@@ -59,6 +63,12 @@ def test_range_rewrites(dialect, sql, ctype, expect):
 ])
 def test_safe_date_types(ctype, ok):
     assert safe_date_type(ctype) is ok
+
+
+def test_quarter_literal_must_start_a_quarter():
+    for literal in ("2024-05-01", "2024-04-02"):
+        sql = f"select a from t where date_trunc('quarter', ts) = '{literal}'"
+        assert rewrite(sql, "duckdb", table_info=typed("TIMESTAMP"))["changes"] == []
 
 
 def test_unknown_type_is_only_offered_in_mode_all():
@@ -179,6 +189,7 @@ PREDICATES = [
     "date({c}) < '2024-01-02'", "date({c}) <= '2024-01-01'", "date({c}) between '2024-01-01' and '2024-02-29'",
     "year({c}) = 2024", "extract(year from {c}) = 2024", "year({c}) between 2023 and 2024",
     "date_trunc('month', {c}) = '2024-02-01'", "date_trunc('year', {c}) = '2024-01-01'",
+    "date_trunc('quarter', {c}) = '2024-01-01'", "date_trunc('quarter', {c}) >= '2024-04-01'",
     "not (date({c}) = '2024-01-01')", "date({c}) = '2024-01-01' or id = 9", "'2024-01-01' < date({c})",
 ]
 

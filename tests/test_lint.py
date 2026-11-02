@@ -67,3 +67,9 @@ def test_count_distinct_union_window_not_in():
 
 def test_scalar_subquery_in_select():
     assert rules("select id, (select max(x) from b where b.id = a.id) from a limit 5")["GV010"] == "info"
+
+
+def test_leading_wildcard_like_is_info():
+    assert rules("select a from t where b like '%x'")["GV013"] == "info"
+    assert rules("select a from t where b ilike '%x%' limit 5")["GV013"] == "info"
+    assert "GV013" not in rules("select a from t where b like 'x%'")
