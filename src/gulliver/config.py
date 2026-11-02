@@ -40,6 +40,8 @@ class Budget:
     max_runtime_s: float = 900.0         # hard stop on predicted runtime
     day_usd: float = 10.00               # total spend per calendar day (local ledger)
     max_output_rows: int = 200           # rows handed back to the agent
+    max_output_chars: int = 50_000       # characters of preview handed back (0 = no limit); see guard.py
+    max_cell_chars: int = 1_000          # longer text cells are cut in the preview (0 = no limit)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> Budget:
@@ -62,6 +64,8 @@ _ENV_BUDGET = {
     "GULLIVER_MAX_RUNTIME_S": "max_runtime_s",
     "GULLIVER_DAY_USD": "day_usd",
     "GULLIVER_MAX_OUTPUT_ROWS": "max_output_rows",
+    "GULLIVER_MAX_OUTPUT_CHARS": "max_output_chars",
+    "GULLIVER_MAX_CELL_CHARS": "max_cell_chars",
 }
 
 

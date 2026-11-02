@@ -29,6 +29,7 @@ RULES = {
     "GV010": "scalar-subquery-in-select",
     "GV011": "window-without-partition",
     "GV012": "not-in-subquery",
+    "GV014": "sensitive-column-in-output",
 }
 
 
@@ -248,6 +249,12 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
                 "NOT IN (subquery) returns nothing if the subquery has a NULL, and often plans badly.",
                 "Use NOT EXISTS or a LEFT JOIN ... WHERE key IS NULL.")
             break
+
+    # GV014 sensitive-column-in-output (column names, lineage, default policy; preflight adds the connection policy)
+    from .guard import lint_findings
+
+    for severity, message, fix in lint_findings(tree, dialect, table_info):
+        add("GV014", severity, message, fix)
 
     findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.rule))
     return findings

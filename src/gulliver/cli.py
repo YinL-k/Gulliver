@@ -46,6 +46,15 @@ def _print_human(result: dict[str, Any]) -> None:
             if result.get("truncated"):
                 print(f"... ({result.get('actual', {}).get('rows', '?')} rows in total)")
         return
+    if "sensitive_tables" in result:
+        for t in result["sensitive_tables"]:
+            print(f"{t['name']}: " + ("nothing sensitive found" if not t["sensitive_columns"] else ""))
+            for c in t["sensitive_columns"]:
+                print(f"  {c['column']:30} {c['kind']:7} {c['category']:12} {c['action']:6} ({c['detected_by']})")
+        for note in result.get("notes") or []:
+            print(f"note: {note}")
+        print(f"\nnext: {result.get('next_step', '')}")
+        return
     if "tables" in result and isinstance(result["tables"], list):
         print(f"{'table':40} {'rows':>14} {'bytes':>12}  partitioned_by")
         for t in result["tables"]:
@@ -61,7 +70,9 @@ def _print_human(result: dict[str, Any]) -> None:
         if t.get("clustered_by"):
             print(f"clustered by: {t['clustered_by']}")
         for c in t.get("columns") or []:
-            print(f"  {c['name']:30} {c['type']}")
+            tag = c.get("sensitive")
+            print(f"  {c['name']:30} {c['type']}" + (f"  [{tag['kind']}: {tag['category']}, {tag['action']}]"
+                                                     if tag else ""))
         print(f"\nnext: {result.get('next_step', '')}")
         return
     if "fixed_sql" in result:
@@ -168,6 +179,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("inspect", help="Biggest tables, or one table's columns")
     p.add_argument("table", nargs="?")
     p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--sensitive", action="store_true",
+                   help="List columns that look like personal data or secrets (by name and earlier values)")
+    p.add_argument("--scan", type=int, default=0, metavar="ROWS",
+                   help="With --sensitive: also check this many rows of text values (one budget-gated query)")
 
     p = sub.add_parser("lint", help="Scale lint only (no database needed)")
     _add_sql_args(p)
@@ -368,6 +383,11 @@ def main(argv: list[str] | None = None) -> int:
             return _emit(result, args.json)
         if args.command == "status":
             result = core.status(settings)
+        elif args.command == "inspect" and (args.sensitive or args.scan):
+            from .guard import inspect_sensitive
+
+            result = inspect_sensitive(settings, connection=conn, table=args.table, limit=args.limit,
+                                       scan_rows=args.scan)
         elif args.command == "inspect":
             result = core.inspect(settings, connection=conn, table=args.table, limit=args.limit)
         elif args.command == "preflight":

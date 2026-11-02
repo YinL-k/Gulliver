@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from . import __version__
+from . import __version__, guard
 from .config import ConfigError, Connection, Settings
 from .engines import Engine, EngineError, TableInfo, dialect_for, get_engine
 from .extrapolate import Fit, fit_power_law, overall_confidence
@@ -113,8 +113,10 @@ def inspect(settings: Settings, connection: str | None = None, table: str | None
                     return _error(f"Table not found or no metadata: {table}",
                                   "Call gulliver_inspect without a table to list what exists.",
                                   connection=conn.name)
+                table_dict = info.as_dict(with_columns=True)
+                guard.tag_columns(settings, conn, table_dict)
                 return {"status": "ok", "connection": conn.name, "engine": conn.engine,
-                        "table": info.as_dict(with_columns=True),
+                        "table": table_dict,
                         "next_step": "Write your SQL using only the columns you need, then call gulliver_preflight."}
             tables = engine.list_tables(limit=max(1, min(int(limit), 200)))
             return {"status": "ok", "connection": conn.name, "engine": conn.engine,
@@ -219,6 +221,7 @@ def _preflight_core(settings: Settings, sql: str, connection: str | None) -> dic
     with _engine(settings, connection) as (_, engine):
         infos, table_notes = _table_infos(engine, statement)
         findings = lint(statement.select, dialect, {k: v.as_dict() for k, v in infos.items()})
+        findings, shield = guard.check_query(settings, conn, statement, dialect, infos, findings)
         select_sql = statement.select.sql(dialect=dialect)
         try:
             estimate = engine.estimate(select_sql)
@@ -230,6 +233,8 @@ def _preflight_core(settings: Settings, sql: str, connection: str | None) -> dic
             return base
         spent = store.spent_today()["usd"]
         gate = _gate(settings, engine, estimate, findings, spent)
+        if shield["blocks"]:
+            gate.update(status="block", blocks=gate["blocks"] + shield["blocks"])
 
     if gate["status"] == "block":
         next_step = "Do not run this. Fix: " + "; ".join(gate["blocks"]) + "."
@@ -249,6 +254,8 @@ def _preflight_core(settings: Settings, sql: str, connection: str | None) -> dic
     )
     if table_notes:
         base["notes"] = table_notes
+    if shield["sensitive_columns"]:
+        base["sensitive_columns"] = shield["sensitive_columns"]
     if findings:
         _attach_autofix(base, sql, dialect, {k: v.as_dict(with_columns=True) for k, v in infos.items()})
     return base
@@ -305,6 +312,11 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
     with _engine(settings, connection) as (_, engine):
         infos, table_notes = _table_infos(engine, statement)
         findings = lint(statement.select, dialect, {k: v.as_dict() for k, v in infos.items()})
+        findings, shield = guard.check_query(settings, conn, statement, dialect, infos, findings)
+        if shield["blocks"]:
+            result.update(status="block", lint=[f.as_dict() for f in findings], reasons=shield["blocks"],
+                          next_step="Do not rehearse this. Fix: " + "; ".join(shield["blocks"]) + ".")
+            return result
         select_sql = statement.select.sql(dialect=dialect)
         full_estimate = engine.estimate(select_sql)
         only, largest_rows = _choose_sample_tables(infos, statement, sample)
@@ -581,8 +593,12 @@ def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | N
             if p is not None and a is not None:
                 comparison[key] = {"predicted": p, "actual": a,
                                    "ratio": round(a / p, 3) if p else None}
-    result = finish("ok", "Done. Show the human the receipt (gulliver_receipt) if they want proof.",
-                    actual=actual, columns=res.columns, preview=res.preview, truncated=res.truncated)
+    # the result guard masks, flags and trims the preview before the agent or the receipt sees it
+    guarded = guard.guard_preview(settings, conn, res.columns, res.preview, pre)
+    result = finish("warn" if guarded.get("data_warnings") else "ok",
+                    guard.run_next_step(guarded, "Done. Show the human the receipt (gulliver_receipt) if they want "
+                                                 "proof."),
+                    actual=actual, truncated=res.truncated or len(guarded["preview"]) < len(res.preview), **guarded)
     if comparison:
         result["predicted_vs_actual"] = comparison
         store.save_receipt(result)
