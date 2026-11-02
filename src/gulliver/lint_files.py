@@ -574,17 +574,16 @@ def _locate_changes(chunk: Chunk, chunk_sql: str, dialect: str, table_info: dict
 
     GV005 range rewrites are replayed on a fresh parse so the replaced comparison nodes (and their token
     positions) are known; other rewrites are found by matching tokens. The caller proves the result."""
-    from .fixer import _fix_ranges, table_columns
+    from .fixer import _fix_ranges, _Log, table_columns
 
     spans: dict[str, list[tuple[int, int]]] = {}
     statement = classify(chunk_sql, dialect)
     if statement.select is not None:
         before_nodes = list(statement.select.find_all(*_COMPARISONS))
-        replay: list[Any] = []
         try:
-            _fix_ranges(statement.select, dialect, table_columns(table_info), "safe", replay)
+            _fix_ranges(statement.select, dialect, table_columns(table_info), "safe", _Log())
         except Exception:
-            replay = []
+            pass
         alive = {id(n) for n in statement.tree.walk()}
         for node in before_nodes:
             if id(node) in alive:

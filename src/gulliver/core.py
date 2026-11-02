@@ -144,10 +144,10 @@ def lint_sql(sql: str, dialect: str = "duckdb") -> dict[str, Any]:
 
 def _attach_autofix(result: dict[str, Any], sql: str, dialect: str, table_info: dict[str, dict] | None) -> None:
     """When a result-preserving rewrite exists, hand the agent the fixed SQL right away (no extra call)."""
-    from .fixer import rewrite
+    from .verify import quick_rewrite
 
     try:
-        out = rewrite(sql, dialect, mode="safe", table_info=table_info)
+        out = quick_rewrite(sql, dialect, table_info)  # the rewrite, plus a short test on generated data
     except Exception:  # an autofix hint must never break preflight or lint
         return
     if not out.get("changes"):
@@ -155,6 +155,8 @@ def _attach_autofix(result: dict[str, Any], sql: str, dialect: str, table_info: 
     result["autofix"] = {"fixed_sql": out["fixed_sql"], "same_result": True,
                          "rules": sorted({c["rule"] for c in out["changes"]}),
                          "changes": out["changes"]}
+    if out.get("verify"):
+        result["autofix"]["verified"] = out["verify"]
     result["next_step"] = (result.get("next_step", "") + " autofix.fixed_sql returns exactly the same rows and avoids "
                            "the " + ", ".join(result["autofix"]["rules"]) + " problem; prefer it.").strip()
 
