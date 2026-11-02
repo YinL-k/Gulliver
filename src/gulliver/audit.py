@@ -133,7 +133,7 @@ def append(path: Path, entry: dict[str, Any]) -> dict[str, Any]:
                 _marker_path(path).write_text(json.dumps({
                     "before": before, "first": entry["hash"],
                     "mac": _marker_mac(key, path.name, before, entry["hash"])}), encoding="utf-8")
-        with path.open("a", encoding="utf-8") as fh:
+        with path.open("a", encoding="utf-8", newline="\n") as fh:   # same bytes on every OS
             fh.write(json.dumps(entry, default=str) + "\n")
     return entry
 

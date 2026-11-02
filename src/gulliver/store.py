@@ -75,24 +75,24 @@ class Store:
         receipt.setdefault("created_at", iso(now_utc()))
         path = self.receipts_dir / f"{rid}.json"
         tmp = path.with_name(f"{rid}.{secrets.token_hex(4)}.tmp")   # unique, so writers never share a tmp file
-        text = json.dumps(receipt, indent=2, default=str)
-        tmp.write_text(text)
+        data = json.dumps(receipt, indent=2, default=str).encode("utf-8")
+        tmp.write_bytes(data)   # bytes, so the file is exactly what is hashed (text mode writes \r\n on Windows)
         os.replace(tmp, path)
-        self._audit("receipt", rid, text)
+        self._audit("receipt", rid, data)
         return rid
 
-    def _audit(self, kind: str, item_id: str, text: str) -> None:
+    def _audit(self, kind: str, item_id: str, data: bytes) -> None:
         from .audit import append, content_hash
 
         append(self.root / "audit.jsonl", {"at": iso(now_utc()), "kind": kind, "id": item_id,
-                                           "sha256": content_hash(text)})
+                                           "sha256": content_hash(data)})
 
     def load_receipt(self, receipt_id: str) -> dict[str, Any] | None:
         safe = Path(receipt_id).name
         path = self.receipts_dir / f"{safe}.json"
         if not path.is_file():
             return None
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def receipts(self) -> list[dict[str, Any]]:
         if not self.receipts_dir.is_dir():
@@ -102,7 +102,7 @@ class Store:
         paths = sorted(self.receipts_dir.glob("*.json"), key=lambda p: (p.name[:18], _mtime(p), p.name), reverse=True)
         for path in paths:
             try:
-                out.append(json.loads(path.read_text()))
+                out.append(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, json.JSONDecodeError):
                 continue
         return out
@@ -135,9 +135,9 @@ class Store:
         }
         if client:
             approval["client"] = client
-        text = json.dumps(approval, indent=2)
-        (self.approvals_dir / f"{Path(receipt_id).name}.json").write_text(text)
-        self._audit("approval", Path(receipt_id).name, text)
+        data = json.dumps(approval, indent=2).encode("utf-8")
+        (self.approvals_dir / f"{Path(receipt_id).name}.json").write_bytes(data)
+        self._audit("approval", Path(receipt_id).name, data)
         return approval
 
     def _audited(self) -> dict[tuple[str, str], str]:
@@ -206,7 +206,7 @@ class Store:
         runs = 0
         bytes_total = 0
         if self.ledger_path.is_file():
-            for line in self.ledger_path.read_text().splitlines():
+            for line in self.ledger_path.read_text(encoding="utf-8").splitlines():
                 try:
                     entry = json.loads(line)
                     if parse_iso(entry["at"]).date() != today:

@@ -166,9 +166,11 @@ def _as_bool(value: Any, key: str, conn_name: str) -> bool:
 
 def too_broad(root: str) -> bool:
     """True for '/', the home folder and any folder above it: reading there reaches ~/.aws, ~/.ssh and the rest."""
-    real = os.path.realpath(root).rstrip(os.sep) + os.sep
-    home = os.path.realpath(os.path.expanduser("~")).rstrip(os.sep) + os.sep
-    return home.startswith(real)
+    real = os.path.normcase(os.path.realpath(root))
+    if os.path.dirname(real) == real:   # '/', a drive root such as 'C:\\' or 'D:\\', a UNC share root
+        return True
+    home = os.path.normcase(os.path.realpath(os.path.expanduser("~")))
+    return (home.rstrip(os.sep) + os.sep).startswith(real.rstrip(os.sep) + os.sep)
 
 
 def allowed_roots(conn: Connection, cwd: str | None = None) -> list[str]:
@@ -289,7 +291,8 @@ def _hidden_part(parts: list[str], glob: bool = False) -> str | None:
 def _glob_matches(pattern: str) -> Iterator[str]:
     """Every existing path an absolute DuckDB glob can match. Unlike Python's glob, '*', '?', '[...]' and '**'
     match hidden names too, as they do in DuckDB."""
-    parts = [p for p in re.split(r"[\\/]", pattern) if p]
+    drive, rest = os.path.splitdrive(pattern)   # 'C:' or '\\\\server\\share' on Windows, '' elsewhere
+    parts = [p for p in re.split(r"[\\/]", rest) if p]
 
     def walk(cur: str, i: int) -> Iterator[str]:
         if i == len(parts):
@@ -315,10 +318,10 @@ def _glob_matches(pattern: str) -> Iterator[str]:
         except OSError:
             return
         for name in names:
-            if fnmatch.fnmatchcase(name, part):
+            if fnmatch.fnmatch(name, part):   # case-insensitive where the file system is (Windows)
                 yield from walk(os.path.join(cur, name), i + 1)
 
-    yield from walk(os.sep, 0)
+    yield from walk(drive + os.sep, 0)   # never a bare 'C:', which is relative to that drive's cwd
 
 
 def _place(full: str, policy: SecurityPolicy, base: str) -> tuple[bool, str | None]:
@@ -326,7 +329,8 @@ def _place(full: str, policy: SecurityPolicy, base: str) -> tuple[bool, str | No
     inside, hidden = False, None
     for root in policy.allowed_paths or ():
         real_root = os.path.realpath(os.path.join(base, root))
-        if full == real_root or full.startswith(real_root.rstrip(os.sep) + os.sep):
+        a, b = os.path.normcase(full), os.path.normcase(real_root)   # Windows paths ignore case
+        if a == b or a.startswith(b.rstrip(os.sep) + os.sep):
             part = _hidden_part(list(Path(os.path.relpath(full, real_root)).parts))
             if part is None:
                 return True, None

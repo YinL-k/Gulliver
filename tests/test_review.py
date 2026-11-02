@@ -203,6 +203,7 @@ def test_review_unknown_models_folder_blocks(repo, state):
     assert review.review(None, base="main", head="feature", models_dir=str(repo / "models"))["status"] == "block"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows file names cannot contain a newline")
 def test_review_file_name_with_a_newline_does_not_shift_contents(repo, state):
     (repo / "models" / "a\nb.sql").write_text("select 1 as x\n", encoding="utf-8")
     git(repo, "add", "-A")

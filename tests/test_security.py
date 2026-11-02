@@ -74,7 +74,8 @@ def test_policy_from_config_file(tmp_path, monkeypatch):
         "allow_remote = ['s3://my-bucket/']\nallow_functions = ['READ_TEXT']\n", encoding="utf-8")
     conn = load_settings().connection("lake")
     policy = security.policy_for(conn)
-    assert policy.allowed_paths == ("/srv/lake", str(tmp_path / "data"))
+    # a rooted path keeps its meaning: '/srv/lake' on POSIX, '<current drive>:\\srv\\lake' on Windows
+    assert policy.allowed_paths == (os.path.abspath("/srv/lake"), str(tmp_path / "data"))
     assert policy.allow_remote == ("s3://my-bucket/",)
     assert policy.allow_functions == {"read_text"}
     assert classify("select * from read_parquet('/srv/lake/a/*.parquet')", "duckdb", policy).kind == "read"
@@ -315,6 +316,7 @@ def test_default_roots_skip_root_and_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / "proj").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))   # what expanduser('~') reads on Windows
     mem = Connection("m", "duckdb", {"path": ":memory:"})
     assert security.allowed_roots(mem, cwd="/") == []
     assert security.allowed_roots(mem, cwd=str(home)) == []
@@ -325,7 +327,8 @@ def test_default_roots_skip_root_and_home(tmp_path, monkeypatch):
     policy = security.policy_for(db, cwd="/")
     assert classify("select * from read_csv('/etc/passwd')", "duckdb", policy).code == "GS004"
     # a human may still write a broad folder, but the selftest then fails instead of skipping
-    assert security.allowed_roots(Connection("w", "duckdb", {"path": ":memory:", "allowed_paths": ["/"]})) == ["/"]
+    broad = Connection("w", "duckdb", {"path": ":memory:", "allowed_paths": ["/"]})
+    assert security.allowed_roots(broad) == [os.path.abspath("/")]
 
 
 def test_selftest_fails_on_a_too_broad_folder(state, tmp_path):
