@@ -133,7 +133,7 @@ def _unit_of(node: exp.Expression | None) -> str | None:
         return None
     text = node.name if isinstance(node, (exp.Var, exp.Literal)) else node.sql()
     text = text.strip("'\"").upper()
-    return {"DAY": "day", "MONTH": "month", "YEAR": "year"}.get(text)
+    return {"DAY": "day", "MONTH": "month", "QUARTER": "quarter", "YEAR": "year"}.get(text)
 
 
 def _truncation(node: exp.Expression) -> tuple[exp.Column, str, str] | None:
@@ -190,6 +190,8 @@ def _literal_start(node: exp.Expression | None, unit: str, kind: str) -> date | 
         return None
     if unit == "month" and day.day != 1:
         return None
+    if unit == "quarter" and (day.day != 1 or day.month not in (1, 4, 7, 10)):
+        return None
     if unit == "year" and (day.month, day.day) != (1, 1):
         return None
     return day
@@ -202,6 +204,8 @@ def _next(start: date, unit: str) -> date | None:
             return date.fromordinal(start.toordinal() + 1)
         if unit == "month":
             return date(start.year + (start.month == 12), start.month % 12 + 1, 1)
+        if unit == "quarter":
+            return date(start.year + (start.month == 10), (start.month + 2) % 12 + 1, 1)
         return date(start.year + 1, 1, 1)
     except (ValueError, OverflowError):
         return None

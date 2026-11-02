@@ -28,6 +28,13 @@ def _read_sql(args: argparse.Namespace) -> str:
     return args.sql
 
 
+def _write_output(args: argparse.Namespace, text: str | None) -> None:
+    """`-o/--output PATH`: write text (SQL, a receipt) to a UTF-8 file, when there is something to write."""
+    path = getattr(args, "output", None)
+    if path and text is not None:
+        Path(path).write_text(text, encoding="utf-8")
+
+
 def _print_human(result: dict[str, Any]) -> None:
     from .receipts import render_markdown
 
@@ -201,6 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("receipt", help="Show a receipt")
     p.add_argument("receipt_id", nargs="?", default="latest")
     p.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    p.add_argument("-o", "--output", metavar="PATH", help="Also write the receipt (in --format) to PATH")
 
     p = sub.add_parser("approve", help="(Human) approve a run that is over the auto-approve limit")
     p.add_argument("receipt_id")
@@ -235,6 +243,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="from_dialect", default="duckdb",
                    choices=["duckdb", "postgres", "bigquery", "snowflake"])
     p.add_argument("--check", action="store_true", help="Preflight the result on the connection (-c)")
+    p.add_argument("-o", "--output", metavar="PATH",
+                   help="Write the translated SQL to PATH (still prints the warnings)")
 
     p = sub.add_parser("diff", help="Do two queries or tables return the same rows?")
     p.add_argument("--left", required=True, help="Query or table name")
@@ -320,9 +330,8 @@ def main(argv: list[str] | None = None) -> int:
                 settings = None
             result = fix(settings, _read_sql(args), connection=args.connection, dialect=args.dialect,
                         mode=args.mode, limit=args.limit)
-            out_path = getattr(args, "output", None)
-            if out_path and result.get("changes") and result.get("fixed_sql") is not None:
-                Path(out_path).write_text(result["fixed_sql"], encoding="utf-8")
+            if result.get("changes"):
+                _write_output(args, result.get("fixed_sql"))
             return _emit(result, args.json)
 
         if args.command in ("lineage", "impact"):
@@ -335,7 +344,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "translate" and not args.check:
             from . import features
 
-            return _emit(features.translate(None, _read_sql(args), args.to_dialect, args.from_dialect), args.json)
+            result = features.translate(None, _read_sql(args), args.to_dialect, args.from_dialect)
+            _write_output(args, result.get("sql"))
+            return _emit(result, args.json)
 
         settings = load_settings(config_path=args.config, dsn=args.dsn)
         conn = args.connection
@@ -352,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "translate":
                 result = features.translate(settings, _read_sql(args), args.to_dialect, args.from_dialect,
                                             connection=conn or settings.default_connection)
+                _write_output(args, result.get("sql"))
             elif args.command == "diff":
                 result = features.diff(settings, args.left, args.right, csv(args.key) or [], connection=conn,
                                        right_connection=args.right_connection, columns=csv(args.columns))
@@ -381,6 +393,10 @@ def main(argv: list[str] | None = None) -> int:
                               allow_write=args.allow_write)
         elif args.command == "receipt":
             result = core.get_receipt(settings, args.receipt_id, fmt=args.format)
+            if result.get("status") == "ok":
+                text = (result["markdown"] if args.format == "markdown"
+                        else json.dumps(result["receipt"], indent=2, default=str) + "\n")
+                _write_output(args, text)
         elif args.command == "approve":
             result = core.approve(settings, args.receipt_id, note=args.note)
         else:  # pragma: no cover - argparse guards this

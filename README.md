@@ -54,7 +54,7 @@ Gulliver sits between the agent and the warehouse:
 | Step | Tool | What happens |
 |---|---|---|
 | 1 | `gulliver_inspect` | Which tables are big? Rows, bytes, partitions, columns. Metadata only, free. |
-| 2 | `gulliver_preflight` | Bytes, rows and money **before** running, plus **scale lint** (12 rules) and the budget gate. When a safe rewrite exists, the answer already contains the fixed SQL (`autofix`). |
+| 2 | `gulliver_preflight` | Bytes, rows and money **before** running, plus **scale lint** (13 rules) and the budget gate. When a safe rewrite exists, the answer already contains the fixed SQL (`autofix`). |
 | 3 | `gulliver_rehearse` | Runs the query on 1%, 3% and 10% samples, fits a growth curve and **predicts the full run** with a confidence range. Catches joins that multiply rows. |
 | 4 | `gulliver_run` | Runs the full query only inside the budget. Otherwise answers `needs_rehearsal` or `needs_approval`. |
 | 5 | `gulliver_receipt` | Markdown proof for the human: what was estimated, rehearsed, approved and run, and predicted vs actual. |
@@ -243,6 +243,21 @@ max_runtime_s = 900
 max_output_rows = 200       # rows handed back to the agent
 ```
 
+### A read-only Postgres role
+
+Gulliver refuses writes itself, but a role that can only read is a good second layer. Run this once as an admin
+and put `gulliver_ro` in the DSN:
+
+```sql
+CREATE ROLE gulliver_ro LOGIN PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE app TO gulliver_ro;
+GRANT USAGE ON SCHEMA public TO gulliver_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO gulliver_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO gulliver_ro;  -- tables created later
+ALTER ROLE gulliver_ro SET statement_timeout = '15min';           -- the server stops runaway queries too
+ALTER ROLE gulliver_ro SET default_transaction_read_only = on;
+```
+
 Or skip the file: `GULLIVER_DSN`, `GULLIVER_MAX_QUERY_USD`, `GULLIVER_DAY_USD` and friends.
 Credentials never go in the config: Gulliver uses each engine's own environment variables and credential chains
 (Google ADC, `SNOWFLAKE_PASSWORD`, `PGPASSWORD`, ...). The agent only ever sees connection *names*.
@@ -376,7 +391,7 @@ GV005 [returns exactly the same rows]
 
 | Rewrite | Rule | Guarantee | Default |
 |---|---|---|---|
-| `DATE(ts) = d`, `ts::date`, `TO_DATE(ts)`, `DATE_TRUNC(day/month/year, ts)`, `YEAR(ts)`, `EXTRACT(YEAR ...)` with `=`, `<`, `<=`, `>`, `>=`, `BETWEEN` → a range on the raw column | GV005 | `same` when the connection shows the column is a DATE or a TIMESTAMP without time zone | yes |
+| `DATE(ts) = d`, `ts::date`, `TO_DATE(ts)`, `DATE_TRUNC(day/month/quarter/year, ts)`, `YEAR(ts)`, `EXTRACT(YEAR ...)` with `=`, `<`, `<=`, `>`, `>=`, `BETWEEN` → a range on the raw column | GV005 | `same` when the connection shows the column is a DATE or a TIMESTAMP without time zone | yes |
 | the same, when the column type is unknown | GV005 | `assumes` (same rows only if it is such a column) | `mode=all` |
 | `a.x NOT IN (SELECT y ...)` → `NOT EXISTS` | GV012 | `nulls`: same rows unless the subquery returns NULL | `mode=all` |
 | `COUNT(DISTINCT x)` → approximate distinct count | GV007 | `changes` (approximate) | `mode=all` |
@@ -413,6 +428,7 @@ own tables, so there the estimate stays the same.
 | GV010 | scalar-subquery-in-select | info |
 | GV011 | window-without-partition | warn |
 | GV012 | not-in-subquery | info |
+| GV013 | leading-wildcard-like | info |
 
 `gulliver lint` works without any database.
 
@@ -426,14 +442,14 @@ gulliver fix SQL [--dialect D] [--mode safe|all] [--limit N] [-o PATH]   rewrite
 gulliver preflight SQL                estimate + lint + gate, no execution
 gulliver rehearse SQL [--fractions 0.01,0.03,0.1] [--sample largest|all] [--method auto|system|bernoulli]
 gulliver run SQL [--max-rows N] [--allow-write]
-gulliver receipt [ID|latest] [--format markdown|json]
+gulliver receipt [ID|latest] [--format markdown|json] [-o PATH]
 gulliver approve ID [--note TEXT]     (human only)
 gulliver demo [PATH]                  create a demo DuckDB database
 gulliver lineage --models DIR | --manifest FILE
 gulliver impact TABLE[.COLUMN] --models DIR | --manifest FILE
 gulliver snapshot | drift [--models DIR] [--save]
 gulliver diff --left SQL --right SQL --key k1,k2 [--right-connection NAME] [--columns a,b]
-gulliver translate SQL --to D [--from D] [--check]
+gulliver translate SQL --to D [--from D] [--check] [-o PATH]
 gulliver incremental SQL [--time-column C] [--unique-key K] [--period 1d] [--lookback 1]
 gulliver check TARGET [--where W] [--unique K] [--not-null C] [--accepted C=a|b] [--range C=min:max] [--fresh C=24h] [--min-rows N] [--max-change PCT]
 gulliver tools --format mcp|openai|gemini
@@ -483,8 +499,7 @@ Postgres against a live server. Reports from real warehouses are very welcome.
 Ideas for what comes next, not promises. Each one is open for help:
 
 - Live tests for BigQuery and Snowflake, so they can leave beta.
-- More same-rows rewrites in `gulliver_fix`, such as `DATE_TRUNC('quarter', ts)` ([#4](https://github.com/laaielichter/Gulliver/issues/4)).
-- A new lint rule for `LIKE` with a leading wildcard ([#5](https://github.com/laaielichter/Gulliver/issues/5)).
+- More same-rows rewrites in `gulliver_fix`.
 - Databricks and ClickHouse engines.
 
 Have a case where an agent's SQL went wrong at scale? [Open an issue](https://github.com/laaielichter/Gulliver/issues/new/choose).

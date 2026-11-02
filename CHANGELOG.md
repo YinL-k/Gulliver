@@ -3,6 +3,13 @@
 ## Unreleased
 
 - `gulliver fix -o/--output PATH`: write rewritten SQL to a file when there are changes ([#6](https://github.com/laaielichter/Gulliver/issues/6)).
+- `gulliver receipt -o PATH` and `gulliver translate -o PATH` write the receipt / translated SQL to a file
+  ([#12](https://github.com/laaielichter/Gulliver/issues/12), [#11](https://github.com/laaielichter/Gulliver/issues/11)).
+- New lint rule GV013 `leading-wildcard-like`: `LIKE '%x'` cannot use an index or min/max statistics
+  ([#5](https://github.com/laaielichter/Gulliver/issues/5)).
+- `gulliver_fix` rewrites `DATE_TRUNC('quarter', ts) = '2024-04-01'` to a range on `ts` (same rows on DATE and
+  TIMESTAMP columns; a literal that does not start a quarter is left alone) ([#4](https://github.com/laaielichter/Gulliver/issues/4)).
+- Docs: a read-only Postgres role for Gulliver, with `statement_timeout` ([#7](https://github.com/laaielichter/Gulliver/issues/7)).
 
 ## 0.2.0 - 2026-11-02
 

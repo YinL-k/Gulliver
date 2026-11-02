@@ -48,3 +48,22 @@ def test_mcp_server_lists_and_calls_tools(demo_db, state, monkeypatch):
     text = json.dumps(result if isinstance(result, (dict, list)) else
                       (result.model_dump() if hasattr(result, "model_dump") else str(result)), default=str)
     assert "GV001" in text
+
+
+def test_cli_receipt_output_file(demo_db, state, tmp_path, capsys):
+    assert main(["--dsn", demo_db, "preflight", "select count(*) from events"]) == 0
+    md = tmp_path / "receipt.md"
+    assert main(["--dsn", demo_db, "receipt", "latest", "--format", "markdown", "-o", str(md)]) == 0
+    assert "select count(*) from events" in md.read_text(encoding="utf-8").lower()
+    js = tmp_path / "receipt.json"
+    assert main(["--dsn", demo_db, "receipt", "latest", "--format", "json", "-o", str(js)]) == 0
+    assert json.loads(js.read_text(encoding="utf-8"))["receipt_id"].startswith("gv-")
+
+
+def test_cli_translate_output_file(tmp_path, capsys):
+    out = tmp_path / "model.bq.sql"
+    assert main(["translate", "--from", "duckdb", "--to", "bigquery", "-o", str(out), "--json",
+                 "select my_udf(x), date_trunc('day', ts) from t"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["warnings"]  # still printed
+    assert out.read_text(encoding="utf-8") == data["sql"]

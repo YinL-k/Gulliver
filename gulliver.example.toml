@@ -25,7 +25,15 @@ credit_usd = 3.00
 # password from SNOWFLAKE_PASSWORD, or authenticator = "externalbrowser"
 
 [connections.pg]
-dsn = "postgresql://analyst@db.internal:5432/app"   # password from PGPASSWORD or ~/.pgpass
+dsn = "postgresql://gulliver_ro@db.internal:5432/app"   # password from PGPASSWORD or ~/.pgpass
+# Second layer of safety: connect with a role that can only read (run once as an admin):
+#   CREATE ROLE gulliver_ro LOGIN PASSWORD '...';
+#   GRANT CONNECT ON DATABASE app TO gulliver_ro;
+#   GRANT USAGE ON SCHEMA public TO gulliver_ro;
+#   GRANT SELECT ON ALL TABLES IN SCHEMA public TO gulliver_ro;
+#   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO gulliver_ro;
+#   ALTER ROLE gulliver_ro SET statement_timeout = '15min';            -- server-side guard
+#   ALTER ROLE gulliver_ro SET default_transaction_read_only = on;
 
 [budget]
 max_query_usd = 1.00          # hard stop for one query
