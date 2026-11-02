@@ -303,12 +303,13 @@ def to_junit(result: dict[str, Any]) -> str:
     return "\n".join([head, *suites, "</testsuites>"])
 
 
-_XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+# Code points XML 1.0 forbids (C0 controls except tab, LF and CR, plus U+FFFE/U+FFFF), as a translate table.
+_XML_BAD = {cp: "\ufffd" for cp in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0xFFFE, 0xFFFF)}
 
 
 def _xml_safe(text: str) -> str:
     """XML 1.0 forbids most control characters (a SQL literal can hold them): replace them with U+FFFD."""
-    return _XML_BAD.sub("\ufffd", text)
+    return text.translate(_XML_BAD)
 
 
 def quoteattr(text: str) -> str:

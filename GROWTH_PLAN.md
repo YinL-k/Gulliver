@@ -5,9 +5,10 @@
 >   bernoulli sampling on DuckDB. On the demo, five seeds predict 252M-257M rows; the real result is 254,966,150 rows.
 >   The README quick-start numbers and the site ladder are updated with measured values.
 > - **0.3.0 docs and version are in:** the README, AGENTS.md, the skill, llms.txt, the site and all package files.
-> - **Still for the human:** re-record `docs/demo.svg` (`docs/demo.sh` needs asciinema and svg-term) and
->   `docs/og.png`; both still show the old prediction. Then everything from section 3 (social preview, Discussions,
->   publishing to PyPI/npm/MCP Registry, filing the good first issues).
+> - **`docs/demo.svg` and `docs/og.png` are re-made** from a real recording of the fixed version (≈ 257 M rows).
+>   Still upload `docs/og.png` as the social preview (Settings > General; there is no API for it).
+> - **Still for the human:** npm publish of the launcher, `mcp-publisher publish` for the MCP Registry, the
+>   social preview upload, Discussions, and the rest of section 3.
 
 Written 2026-11-02. Time zone: Europe/Amsterdam (CET, UTC+1). US is on standard time since 1 Nov, so 15:00 Amsterdam = 09:00 ET = 06:00 PT.
 Repo: https://github.com/laaielichter/Gulliver. Nothing in this plan has been posted, filed or submitted.
