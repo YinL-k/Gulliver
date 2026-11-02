@@ -64,7 +64,8 @@ def typed(result: Any) -> Any:
 CORE_TOOLS = ("gulliver_status", "gulliver_inspect", "gulliver_lint", "gulliver_fix", "gulliver_preflight",
               "gulliver_rehearse", "gulliver_run", "gulliver_receipt")
 PIPELINE_TOOLS = ("gulliver_status", "gulliver_inspect", "gulliver_receipt", "gulliver_impact", "gulliver_drift",
-                  "gulliver_diff", "gulliver_translate", "gulliver_incremental", "gulliver_check", "gulliver_top")
+                  "gulliver_diff", "gulliver_translate", "gulliver_incremental", "gulliver_check", "gulliver_top",
+                  "gulliver_review")
 TOOLSETS = {"core": CORE_TOOLS, "pipeline": PIPELINE_TOOLS}
 
 

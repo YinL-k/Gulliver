@@ -46,6 +46,8 @@ More tools for pipelines:
 - gulliver_incremental: turn a full-rebuild model into an incremental one, with the rows it saves.
 - gulliver_check: data quality (unique, not null, accepted values, range, freshness, row count) in one scan.
 - gulliver_top: the most expensive repeated queries from query history, with priced same-rows fixes.
+- gulliver_review: before opening a PR, review the changed SQL models (new lint, breaking changes, downstream
+  impact, cost per run and per month). status block means the team's review policy says do not merge.
 
 Every result has `status` and `next_step`. Follow next_step. Status block means: do not try to work around it,
 change the SQL. Only SELECT, and CREATE/INSERT ... SELECT (when a human enabled writes), are accepted.
@@ -210,6 +212,7 @@ def build_server(toolset: str | None = None) -> Any:
         return _guard(core.get_receipt, receipt_id, fmt=format)
 
     _register_feature_tools(server)
+    _register_review_tool(server)
     native.install(server, _guard, _settings, toolset)  # resources, prompts, --toolset
     _stamp_identity(server)
     return server
@@ -357,6 +360,33 @@ def _register_feature_tools(server: Any) -> None:
 
         return _guard(workload.top, source=source, connection=connection, days=days, limit=limit, analyze=analyze,
                       rank_by=rank_by, path=path, dialect=dialect)
+
+
+def _register_review_tool(server: Any) -> None:
+    from . import review
+
+    @server.tool(name="gulliver_review", annotations=RUNS_QUERIES,
+                 description="PR gate for SQL models: for each .sql model changed between a base ref and head (git) "
+                             "or between two dbt manifests, report new scale lint, the change type (cosmetic, "
+                             "non_breaking, breaking), the downstream models that break and, with a connection, the "
+                             "scan and money per run and per month before vs after (estimates). rehearse=true also "
+                             "runs 1% and 3% samples to catch new row explosions. status 'block' means the [review] "
+                             "policy says do not merge. Call before opening a PR.")
+    def gulliver_review(
+        models_dir: MODELS = None,
+        base: Annotated[str, Field(description="Base ref to compare against, e.g. 'origin/main'.")] = "origin/main",
+        head: Annotated[str, Field(description="Head ref (only committed changes are reviewed).")] = "HEAD",
+        manifest_base: Annotated[str | None, Field(description="dbt manifest.json of the base build (instead of "
+                                                               "git).")] = None,
+        manifest_head: Annotated[str | None, Field(description="dbt manifest.json of the branch.")] = None,
+        connection: CONNECTION = None,
+        rehearse: Annotated[bool, Field(description="Also run changed models on 1% and 3% samples (budget-checked; "
+                                                    "costs money on billed engines).")] = False,
+        markdown: Annotated[bool, Field(description="Also return the PR-comment markdown.")] = False,
+    ) -> dict[str, Any]:
+        return _guard(review.for_agent, markdown=markdown, base=base, head=head, models_dir=models_dir,
+                      manifest_base=manifest_base, manifest_head=manifest_head, connection=connection,
+                      rehearse=rehearse, config_path=_ARGS["config"])
 
 
 def tool_schemas(toolset: str | None = None) -> list[dict[str, Any]]:
