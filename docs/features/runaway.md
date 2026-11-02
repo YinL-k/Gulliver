@@ -11,15 +11,19 @@ queries of `diff`, `check` and `incremental`) just before it runs:
 |---|---|---|---|
 | `max_repeats` / `repeat_window_min` | 5 runs / 30 min | the same query on the same connection runs again, the tables did not change | `block`, reason `loop`, with the last result in `cached` (free) |
 | | | ... and Gulliver cannot tell whether the data changed | `needs_approval`, reason `repeat` |
-| `velocity_usd` / `velocity_window_min` | $2 / 10 min | one agent or session spends faster than this | `needs_approval`, reason `velocity` |
+| `velocity_usd` / `velocity_window_min` | $2 / 10 min | one agent (across all its sessions) or one session spends faster than this | `needs_approval`, reason `velocity` |
 | `session_usd` | off | one session spent its budget | `block`, reason `session_budget` |
 | `agent_day_usd` | off | one agent spent its budget for today | `block`, reason `agent_budget` |
 
 Repeats that are cheap (under $0.01 **and** under 1 GB) are never treated as a loop, so looking at a small
-table again and again just works. A repeat is also allowed when the tables changed since the last run.
+table again and again just works. When the estimate has no byte count (`count(*)`, `select 42`), the size of
+the tables it reads from metadata is used instead; a query on a view of unknown size is not cheap.
+A repeat is also allowed when the tables changed since the last run. "The same query" ignores case,
+whitespace, a trailing `;` and comments, so `-- retry 2` does not make it a new query.
 A human approval (`gulliver approve <receipt_id>`) for a query buys it another `max_repeats` runs and lifts
-the velocity check for that query for the length of the window. The per-query and per-day limits still apply
-to everyone.
+the velocity check for that query for the length of the window. It only counts as approval of the run's cost
+when it was given for at least that cost: approving a rehearsal's velocity request does not approve the full
+run. The per-query and per-day limits still apply to everyone.
 
 ### Who is asking
 
@@ -77,12 +81,14 @@ unknown (so it asks a human instead of blocking):
 
 | Engine | Change signal | No signal (treated as unknown) |
 |---|---|---|
-| DuckDB | mtime + size of the database file and its WAL; of each file read with `read_parquet(...)` etc. | in-memory databases, views, attached databases, remote files |
+| DuckDB | mtime + size of the database file and its WAL; of each file read with `read_parquet(...)` etc. or `FROM 'x.parquet'` | in-memory databases, views, attached databases, remote files, names that are neither a table nor a local file |
 | BigQuery | `lastModifiedTime`, rows and bytes of each table | views, external and wildcard tables, tables with a streaming buffer |
 | Snowflake | `LAST_ALTERED` (moves on every DML and DDL), rows and bytes | views, external and dynamic tables, tables in another database |
 | Postgres | none: `pg_stat_user_tables` counters are updated asynchronously, so they can lag right after a write | always unknown |
 
-Queries with `NOW()`, `CURRENT_DATE`, `RANDOM()`, `UUID()` or `TABLESAMPLE` never count as unchanged.
+Queries with `NOW()`, `CURRENT_DATE`, `RANDOM()`, `UUID()`, `TABLESAMPLE`, `get_current_timestamp()`,
+`uuidv4()`/`uuidv7()`, `nextval()`, `txid_current()`, or any function whose name contains `current`, `random`,
+`uuid`, `nextval`, `txid`, `sysdate`, `getdate` or `clock`, never count as unchanged.
 
 ### Query tags
 
@@ -112,7 +118,8 @@ $ gulliver spend --by table --json
 ```
 
 `--by table` splits a query that reads several tables evenly between them, so the rows add up to the total.
-Lines written before this version have no agent and show as `(unknown)`.
+Lines written before this version have no agent and show as `(unknown)`. Current lines without a session or
+task (CLI calls without `GULLIVER_SESSION` / `GULLIVER_TASK`), and queries that read no table, show as `(none)`.
 
 ### Audit chain
 
@@ -128,8 +135,11 @@ $ gulliver audit verify --head 9343ac02...     # later: prove nothing up to that
 ```
 
 It reports an edited, removed, reordered or inserted ledger line, and a receipt or approval file that changed
-or disappeared after Gulliver wrote it (`status: fail`, exit code 4). Lines and files from before the chain
-existed are counted and reported as a warning.
+or disappeared after Gulliver wrote it (`status: fail`, exit code 4). A receipt or approval file with no audit
+entry that is dated after the chain started (written by hand, or `audit.jsonl` was deleted), and a line without
+a hash that is newer than the chain, are also a `fail`. An approval file without a matching audit entry is
+ignored by `gulliver_run`, so a hand-written approval approves nothing. Lines and files from before the chain
+existed are counted and reported as a warning; verify only says "Intact" when there are no warnings.
 
 ### Guarantees and limits
 
@@ -142,6 +152,10 @@ existed are counted and reported as a warning.
 - A cached result is the last run's preview (at most `max_output_rows` rows); `cached.rows` is the full count.
 - Without `GULLIVER_AUDIT_KEY` the chain is plain sha256: anyone who can write `.gulliver` can rebuild it.
   Set the key somewhere the agent cannot read and the hashes become HMACs that cannot be recomputed without it.
+  When the first keyed line of a file is written, `<file>.keyed` (itself an HMAC) records how many lines came
+  before it. With the key set, every later line must be keyed, so a chain rebuilt as plain sha256 or stripped
+  of its hashes fails; without the marker every line must be keyed. After the key is set, approvals recorded
+  before it no longer count.
   Removing the newest lines leaves a shorter valid chain; keep a `head` hash elsewhere and pass `--head` to
   catch that.
 - Repeat counting and spend sums read the local ledger, so they cover this machine's `.gulliver` folder only.

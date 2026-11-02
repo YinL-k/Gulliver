@@ -7,6 +7,9 @@
 receipt or approval file that changed after Gulliver wrote it. Limits, stated plainly:
   - Without a key anyone who can write the folder can rebuild the whole chain. Set GULLIVER_AUDIT_KEY
     (kept away from the agent) to make the hashes HMACs that cannot be recomputed without it.
+    When the first keyed line of a file is written, a marker (`<file>.keyed`, itself an HMAC) records how
+    many lines came before it. With the key set, verify requires every later line to be keyed, so a chain
+    rebuilt as plain sha256, or stripped of its hashes, fails; a deleted marker means "keyed from line 1".
   - Removing the newest lines leaves a valid, shorter chain. Keep the `head` hash that verify prints
     somewhere else and pass it back with --head to prove nothing up to it was removed.
 """
@@ -82,47 +85,117 @@ def _last_hash(path: Path) -> str:
         return GENESIS
 
 
+def _marker_path(path: Path) -> Path:
+    return path.with_name(path.name + ".keyed")
+
+
+def _marker_mac(key: bytes, name: str, before: int, first: str) -> str:
+    return hmac.new(key, f"{name}|{before}|{first}".encode(), hashlib.sha256).hexdigest()
+
+
+def _count_lines(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    with path.open("rb") as fh:
+        return sum(1 for line in fh if line.strip())
+
+
+def read_marker(path: Path) -> dict[str, Any] | None:
+    """The keyed-genesis marker of a chained file: {"before": lines before the first keyed line, "first": its
+    hash, "valid": the MAC checks out (None: no key here)}. None when there is no (readable) marker."""
+    try:
+        data = json.loads(_marker_path(path).read_text(encoding="utf-8"))
+        before, first, mac = int(data["before"]), str(data["first"]), str(data["mac"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    key = _key()
+    valid = hmac.compare_digest(_marker_mac(key, path.name, before, first), mac) if key else None
+    return {"before": before, "first": first, "valid": valid}
+
+
 def append(path: Path, entry: dict[str, Any]) -> dict[str, Any]:
     """Append one chained JSON line and return it (with prev and hash)."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    key = _key()
     with _locked(path):
+        last = _last_line(path)
         entry = {**entry, "prev": _last_hash(path)}
-        if _key():
+        if key:
             entry["alg"] = HMAC
         entry["hash"] = entry_hash(entry)
+        if key and not _marker_path(path).exists():
+            try:
+                last_keyed = json.loads(last).get("alg") == HMAC if last else False
+            except (json.JSONDecodeError, AttributeError):
+                last_keyed = False
+            if not last_keyed:   # the first keyed line of this file: record where keying started
+                before = _count_lines(path)
+                _marker_path(path).write_text(json.dumps({
+                    "before": before, "first": entry["hash"],
+                    "mac": _marker_mac(key, path.name, before, entry["hash"])}), encoding="utf-8")
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, default=str) + "\n")
     return entry
 
 
 def verify_chain(path: Path) -> dict[str, Any]:
-    """Check one chained file. Lines written before chaining existed (no hash) are counted, not failed."""
+    """Check one chained file. Lines written before chaining existed (no hash) are counted, not failed.
+
+    With GULLIVER_AUDIT_KEY set, every line after the keyed-genesis marker's `before` (all lines, when there is
+    no valid marker) must be keyed: an unkeyed or hashless line there is a problem, not legacy."""
     out: dict[str, Any] = {"file": path.name, "entries": 0, "chained": 0, "legacy": 0, "head": GENESIS,
-                           "problems": [], "hashes": set()}
+                           "problems": [], "hashes": set(), "first_at": None, "legacy_at": []}
+    marker = read_marker(path)
+    strict = _key() is not None
+    before = 0
+    if marker is not None:
+        if marker["valid"] is False:
+            out["problems"].append(f"{path.name}.keyed (where keying started) was changed or written without "
+                                   "the key")
+        else:
+            before = marker["before"]
+    # no (valid) marker: with a key set, every line must be keyed from line 1
     if not path.is_file():
+        if marker is not None:
+            out["problems"].append(f"{path.name} is missing although keyed lines were written to it")
         return out
     prev = GENESIS
     started = keyed = False
+    must_key = strict or marker is not None
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
         out["entries"] += 1
+        after_key = must_key and out["entries"] > before
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
             out["problems"].append(f"{path.name} line {number} is not valid JSON")
             continue
         if not isinstance(entry, dict) or "hash" not in entry:
-            if started:
+            if after_key:
+                out["problems"].append(f"{path.name} line {number} has no hash although {KEY_ENV} was set "
+                                       "when it was written (stripped or added outside Gulliver?)")
+            elif started:
                 out["problems"].append(f"{path.name} line {number} has no hash (added outside Gulliver?)")
             else:
                 out["legacy"] += 1
+                if isinstance(entry, dict) and entry.get("at"):
+                    out["legacy_at"].append(str(entry["at"]))
             continue
+        if not started and isinstance(entry.get("at"), str):
+            out["first_at"] = entry["at"]
         started = True
         out["chained"] += 1
         expected = entry_hash(entry)
         if entry.get("alg") == HMAC:
             keyed = True
+            if marker is not None and out["entries"] == before + 1 and entry.get("hash") != marker["first"]:
+                out["problems"].append(f"{path.name} line {number} is not the first keyed line Gulliver wrote "
+                                       "(the lines before it were rewritten)")
+        elif after_key:
+            out["problems"].append(f"{path.name} line {number} is not keyed although {KEY_ENV} was set when it "
+                                   "was written (the chain was rebuilt without the key?)")
         elif keyed:
             out["problems"].append(f"{path.name} line {number} is not keyed although earlier lines are "
                                    "(rewritten without GULLIVER_AUDIT_KEY?)")
@@ -135,5 +208,8 @@ def verify_chain(path: Path) -> dict[str, Any]:
                                    "(a line was removed, reordered or inserted)")
         prev = str(entry["hash"])
         out["hashes"].add(prev)
+    if marker is not None and marker["valid"] is not False and out["entries"] <= before:
+        out["problems"].append(f"{path.name} has no keyed line although {path.name}.keyed says line "
+                               f"{before + 1} was keyed (the newest lines were removed)")
     out["head"] = prev
     return out

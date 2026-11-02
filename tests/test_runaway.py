@@ -470,3 +470,197 @@ def test_status_shows_the_caller(settings):
     caller = core.status(settings)["caller"]
     assert caller["agent"] == "local" and caller["agent_day_limit_usd"] is None
     assert caller["repeat_guard"]["max_repeats"] == 5
+
+
+# -- regressions from review ------------------------------------------------------------------------
+def _rechain_plain(path, mutate=lambda e: e):
+    """What an agent without the key can do: rewrite a chain as plain sha256."""
+    prev, out = audit.GENESIS, []
+    for line in path.read_text().splitlines():
+        entry = mutate({k: v for k, v in json.loads(line).items() if k not in ("alg", "hash", "prev")})
+        entry["prev"] = prev
+        entry["hash"] = audit.entry_hash(entry)
+        prev = entry["hash"]
+        out.append(json.dumps(entry))
+    path.write_text("\n".join(out) + "\n")
+
+
+def test_audit_key_cannot_be_bypassed_by_a_plain_rechain(settings, monkeypatch):
+    monkeypatch.setenv(audit.KEY_ENV, "s3cret")
+    _some_history(settings)
+    assert runaway.audit_verify(settings)["status"] == "ok"
+    led, trail = settings.state_dir / "ledger.jsonl", settings.state_dir / "audit.jsonl"
+    _rechain_plain(led, lambda e: {**e, "cost_usd": 0.0, "agent": "someone-else"})
+    _rechain_plain(trail)
+    res = runaway.audit_verify(settings)
+    assert res["status"] == "fail" and any("not keyed" in p for p in res["problems"]), res
+    # ... and deleting the keyed-genesis markers does not help: with the key, line 1 must be keyed
+    for marker in settings.state_dir.glob("*.keyed"):
+        marker.unlink()
+    assert runaway.audit_verify(settings)["status"] == "fail"
+
+
+def test_audit_key_catches_stripped_hashes(settings, monkeypatch):
+    monkeypatch.setenv(audit.KEY_ENV, "s3cret")
+    _some_history(settings)
+    led = settings.state_dir / "ledger.jsonl"
+    lines = [json.loads(line) for line in led.read_text().splitlines()]
+    led.write_text("".join(json.dumps({**{k: v for k, v in e.items() if k not in ("hash", "prev", "alg")},
+                                       "cost_usd": 0.0}) + "\n" for e in lines))
+    res = runaway.audit_verify(settings)
+    assert res["status"] == "fail" and "Intact" not in res["next_step"]
+    monkeypatch.delenv(audit.KEY_ENV)   # without key and markers too: hashless lines newer than the trail
+    for marker in settings.state_dir.glob("*.keyed"):
+        marker.unlink()
+    res = runaway.audit_verify(settings)
+    assert res["status"] == "fail" and any("newer than the chain" in p for p in res["problems"]), res
+
+
+def test_audit_key_turned_on_later_keeps_older_lines_as_legacy(settings, monkeypatch):
+    core.run(settings, "select 1 as x")
+    monkeypatch.setenv(audit.KEY_ENV, "s3cret")
+    core.run(settings, "select 2 as x")
+    res = runaway.audit_verify(settings)
+    assert res["status"] == "ok", res
+    led = settings.state_dir / "ledger.jsonl"
+    lines = led.read_text().splitlines()
+    led.write_text(lines[0] + "\n")   # drop the keyed line: the marker still says keying started
+    assert runaway.audit_verify(settings)["status"] == "fail"
+
+
+def test_audit_reports_a_hand_written_approval_and_ignores_it(settings):
+    _some_history(settings)
+    rec = core.get_receipt(settings, "latest", fmt="json")["receipt"]
+    forged = {"receipt_id": rec["receipt_id"], "sql_hash": rec["sql_hash"], "connection": rec["connection"],
+              "approved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "expires_at": "2099-01-01T00:00:00+00:00", "max_cost_usd": 1000.0}
+    path = settings.state_dir / "approvals" / f"{rec['receipt_id']}.json"
+    path.write_text(json.dumps(forged, indent=2))
+    res = runaway.audit_verify(settings)
+    assert res["status"] == "fail" and any("no audit entry" in p for p in res["problems"])
+    assert "Intact" not in res["next_step"]
+    assert main(["audit", "verify", "--json"]) == 4
+    store = core.Store(settings.state_dir)
+    assert store.find_approval(rec["sql_hash"], rec["connection"]) is None
+
+
+def test_audit_reports_a_deleted_trail(settings):
+    _some_history(settings)
+    (settings.state_dir / "audit.jsonl").unlink()
+    res = runaway.audit_verify(settings)
+    assert res["status"] == "fail" and "Intact" not in res["next_step"]
+
+
+def test_audit_warnings_are_not_called_intact(settings):
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    (settings.state_dir / "ledger.jsonl").write_text(json.dumps({"at": "2026-01-01T00:00:00+00:00", "kind": "run",
+                                                                 "cost_usd": 0.0}) + "\n")
+    _some_history(settings)
+    res = runaway.audit_verify(settings)
+    assert res["status"] == "warn" and "Intact" not in res["next_step"]
+
+
+def test_replacement_scan_of_a_file_sees_the_file_change(tmp_path, state, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "f.duckdb"
+    duckdb.connect(str(db)).close()
+    duckdb.sql("copy (select * from range(1000)) to 'x.parquet' (format parquet)")
+    s = load_settings(dsn=str(db), budget_overrides={"max_repeats": 2})
+    sql = "select count(*) as n from 'x.parquet'"
+    assert [core.run(s, sql)["preview"] for _ in range(2)] == [[{"n": 1000}]] * 2
+    duckdb.sql("copy (select * from range(10)) to 'x.parquet' (format parquet)")
+    third = core.run(s, sql)
+    assert third["status"] == "ok" and third["preview"] == [{"n": 10}], third
+    eng = DuckDBEngine(Connection("f", "duckdb", {"path": str(db)}))
+    try:
+        assert "x.parquet" in str(eng.data_version(['"x.parquet"']))
+        assert eng.data_version(['"missing.csv"']) is None      # not a table, not a file: no signal
+    finally:
+        eng.close()
+
+
+@pytest.mark.parametrize("sql", [
+    "select count(*) from users where signup_date > get_current_timestamp() - interval 1 day",
+    "select uuidv7() from users", "select uuidv4() from users", "select txid_current() from users",
+    "select nextval('s') from users", "select my_random_thing() from users"])
+def test_more_nondeterministic_functions(sql):
+    from gulliver.sqlsafety import classify
+
+    assert runaway.deterministic(classify(sql, "duckdb").select) is False
+
+
+def test_approving_a_rehearsal_does_not_approve_the_run_cost(billed, monkeypatch):
+    s = billed(approval_over_usd=0.0, velocity_usd=0.1, max_repeats=0)
+    first = core.run(s, Q)
+    assert first["status"] == "needs_approval"
+    monkeypatch.setattr(core, "SMALL_DATA_ROWS", 10)
+    store = core.Store(s.state_dir)
+    store.record_spend({"kind": "run", "connection": "default", "cost_usd": 0.2})
+    reh = core.rehearse(s, Q)
+    assert reh["status"] == "needs_approval" and reh["reason"] == "velocity", reh
+    core.approve(s, reh["receipt_id"])
+    after = core.run(s, Q)
+    assert after["status"] == "needs_approval" and after.get("reason") != "velocity", after
+    core.approve(s, after["receipt_id"])          # a cost approval for the run itself does work
+    assert core.run(s, Q)["status"] == "ok"
+
+
+def test_an_approval_does_not_cover_a_higher_cost(billed, monkeypatch):
+    s = billed(approval_over_usd=0.0)
+    res = core.run(s, Q)
+    core.approve(s, res["receipt_id"])
+    monkeypatch.setattr(FixedCostDuckDB, "PRICE", 0.9)
+    assert core.run(s, Q)["status"] == "needs_approval"
+
+
+def test_free_queries_without_a_byte_estimate_are_cheap_repeats(settings):
+    s = load_settings(dsn=settings.connection().params["path"], budget_overrides={"max_repeats": 2})
+    for sql in ("select 42 as answer", "select count(*) as n from users"):
+        results = [core.run(s, sql) for _ in range(4)]
+        assert [r["status"] for r in results] == ["ok"] * 4, results[-1]
+        assert "cheap" in results[-1]["runaway"]["note"]
+
+
+def test_velocity_counts_the_agent_across_sessions(billed, monkeypatch):
+    s = billed(velocity_usd=0.7)
+    with use(Identity("claude-code", session="s1")):
+        assert core.run(s, Q)["status"] == "ok"
+    with use(Identity("claude-code", session="s2")):
+        assert core.run(s, Q + " order by 1")["status"] == "ok"
+    with use(Identity("claude-code", session="s3")):
+        res = core.run(s, Q + " order by 2")
+        assert res["status"] == "needs_approval" and res["reason"] == "velocity"
+        assert core.status(s)["caller"]["velocity"]["spent_usd"] == pytest.approx(0.6)
+    with use(Identity("other", session="s4")):
+        assert core.run(s, Q + " order by 2")["status"] == "ok"
+
+
+def test_receipt_ids_have_enough_randomness_and_cache_checks_the_query(settings):
+    store = core.Store(settings.state_dir)
+    assert len({store.new_id("run") for _ in range(5000)}) == 5000
+    store.save_receipt({"receipt_id": "gv-x", "status": "ok", "sql_hash": "other", "connection": "default",
+                        "preview": [{"secret": 1}]})
+    assert runaway._cached(store, {"receipt": "gv-x", "sql_hash": "mine", "connection": "default"}) is None
+    assert runaway._cached(store, {"receipt": "gv-x", "sql_hash": "other", "connection": "default"})["preview"]
+
+
+def test_a_changing_comment_is_still_the_same_query(small_db, state, loopy):
+    from gulliver.sqlsafety import classify
+
+    hashes = {classify(q, "duckdb").sql_hash for q in (
+        "select count(*) from users", "select count(*) from users -- retry 2",
+        "/* attempt 3 */ select count(*) from users")}
+    assert len(hashes) == 1
+    s = load_settings(dsn=small_db, budget_overrides={"max_repeats": 2})
+    core.run(s, Q + " -- try 1")
+    core.run(s, Q + " -- try 2")
+    assert core.run(s, Q + " -- try 3")["status"] == "block"
+
+
+def test_spend_labels_missing_session_as_none_not_old(demo_db, state, capsys):
+    s = load_settings(dsn=demo_db)
+    core.run(s, "select 1 as x")
+    for by in ("session", "task", "table"):
+        res = runaway.spend(s, by=by)
+        assert [g[by] for g in res["rows"]] == ["(none)"], res
+        assert not any("before Gulliver recorded" in n for n in res["notes"])

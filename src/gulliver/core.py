@@ -596,7 +596,7 @@ def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | N
     if cost_for_gate is not None and spent + cost_for_gate > budget.day_usd:
         return finish("block", f"Today's budget would be exceeded (spent {_fmt_usd(spent)}, limit {_fmt_usd(budget.day_usd)}).")
     if cost_for_gate is not None and cost_for_gate > budget.approval_over_usd:
-        approval = store.find_approval(pre["sql_hash"], conn.name)
+        approval = store.find_approval(pre["sql_hash"], conn.name, cost=cost_for_gate)
         if approval is None:
             rid = store.new_id("run")
             pre["receipt_id"] = rid

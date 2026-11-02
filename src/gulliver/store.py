@@ -66,14 +66,15 @@ class Store:
 
     # -- receipts ------------------------------------------------------------------
     def new_id(self, action: str) -> str:
-        return f"gv-{now_utc().strftime('%Y%m%d-%H%M%S')}-{action[:3]}-{secrets.token_hex(2)}"
+        # 32 random bits: parallel writers (several MCP sessions, diff/check internals) must not share an id
+        return f"gv-{now_utc().strftime('%Y%m%d-%H%M%S')}-{action[:3]}-{secrets.token_hex(4)}"
 
     def save_receipt(self, receipt: dict[str, Any]) -> str:
         self._ensure()
         rid = receipt.setdefault("receipt_id", self.new_id(receipt.get("action", "rec")))
         receipt.setdefault("created_at", iso(now_utc()))
         path = self.receipts_dir / f"{rid}.json"
-        tmp = path.with_suffix(".tmp")
+        tmp = path.with_name(f"{rid}.{secrets.token_hex(4)}.tmp")   # unique, so writers never share a tmp file
         text = json.dumps(receipt, indent=2, default=str)
         tmp.write_text(text)
         os.replace(tmp, path)
@@ -139,18 +140,55 @@ class Store:
         self._audit("approval", Path(receipt_id).name, text)
         return approval
 
-    def find_approval(self, sql_hash: str, connection: str) -> dict[str, Any] | None:
+    def _audited(self) -> dict[tuple[str, str], str]:
+        """(kind, id) -> sha256 of the file as Gulliver wrote it, from audit.jsonl. With GULLIVER_AUDIT_KEY set,
+        only lines whose HMAC checks out count."""
+        from .audit import HMAC, _key, entry_hash
+
+        path = self.root / "audit.jsonl"
+        out: dict[tuple[str, str], str] = {}
+        if not path.is_file():
+            return out
+        keyed = _key() is not None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+                if keyed and (entry.get("alg") != HMAC or entry_hash(entry) != entry.get("hash")):
+                    continue
+                out[(entry["kind"], entry["id"])] = entry["sha256"]
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+        return out
+
+    def find_approval(self, sql_hash: str, connection: str, cost: float | None = None) -> dict[str, Any] | None:
+        """A live human approval for this query. Only approvals Gulliver wrote count (the file must match its
+        audit entry, so one written by hand is ignored). With `cost`, only an approval given for at least that
+        cost counts: approving a rehearsal or a velocity request does not approve the full run's cost."""
         if not self.approvals_dir.is_dir():
             return None
+        from .audit import content_hash
+
+        audited: dict[tuple[str, str], str] | None = None
         now = now_utc()
         for path in sorted(self.approvals_dir.glob("*.json"), reverse=True):
             try:
-                data = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
+                raw = path.read_bytes()
+                data = json.loads(raw)
+                live = (data.get("sql_hash") == sql_hash and data.get("connection") == connection
+                        and parse_iso(data["expires_at"]) > now)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 continue
-            if (data.get("sql_hash") == sql_hash and data.get("connection") == connection
-                    and parse_iso(data["expires_at"]) > now):
-                return data
+            if not live:
+                continue
+            if cost is not None:
+                approved = data.get("max_cost_usd")
+                if not isinstance(approved, (int, float)) or approved < cost - 1e-9:
+                    continue
+            if audited is None:
+                audited = self._audited()
+            if audited.get(("approval", path.stem)) != content_hash(raw):
+                continue
+            return data
         return None
 
     # -- ledger --------------------------------------------------------------------

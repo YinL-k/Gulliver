@@ -27,7 +27,8 @@ import csv
 import hashlib
 import io
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from sqlglot import exp
@@ -49,7 +50,12 @@ _NONDETERMINISTIC = {"CurrentDate", "CurrentTimestamp", "CurrentTime", "CurrentD
 _NONDETERMINISTIC_NAMES = {"now", "getdate", "sysdate", "systimestamp", "clock_timestamp", "statement_timestamp",
                            "transaction_timestamp", "timeofday", "random", "uuid", "gen_random_uuid", "newid",
                            "generate_uuid", "uuid_string", "current_timestamp", "current_date", "current_time",
-                           "localtimestamp", "today", "seq4", "seq8", "random_uuid"}
+                           "localtimestamp", "today", "seq4", "seq8", "random_uuid", "get_current_timestamp",
+                           "get_current_time", "get_current_date", "uuidv4", "uuidv7", "txid_current", "nextval",
+                           "currval", "lastval", "setseed", "session_user", "current_user", "user", "pg_backend_pid",
+                           "unix_timestamp", "current_setting", "current_query", "random_string"}
+# any other function whose name says it reads the clock, a sequence or a random source
+_NONDETERMINISTIC_PARTS = ("current", "random", "uuid", "nextval", "txid", "sysdate", "getdate", "clock")
 
 
 # -- ledger ---------------------------------------------------------------------------------
@@ -77,11 +83,13 @@ def agent_limit(settings: Settings, agent: str) -> float | None:
     return float(value) if value else None
 
 
-def _mine(entries: list[dict[str, Any]], ident: Identity) -> list[dict[str, Any]]:
-    """The caller's own entries: same session when there is one, else same agent."""
-    if ident.session:
-        return [e for e in entries if e.get("session") == ident.session]
-    return [e for e in entries if e.get("agent") == ident.agent and not e.get("session")]
+def _velocity_spent(entries: list[dict[str, Any]], ident: Identity, since: datetime) -> float:
+    """Spend within the velocity window of this session and of this agent across all its sessions (a new
+    MCP connection or a reconnect must not start an empty window): the larger of the two."""
+    recent = [e for e in entries if e["_at"] >= since]
+    agent = _usd([e for e in recent if e.get("agent") == ident.agent])
+    session = _usd([e for e in recent if e.get("session") == ident.session]) if ident.session else 0.0
+    return max(agent, session)
 
 
 # -- change signal and tags -----------------------------------------------------------------
@@ -92,8 +100,10 @@ def deterministic(tree: exp.Expression | None) -> bool:
     for node in tree.walk():
         if type(node).__name__ in _NONDETERMINISTIC:
             return False
-        if isinstance(node, exp.Anonymous) and str(node.name).lower() in _NONDETERMINISTIC_NAMES:
-            return False
+        if isinstance(node, exp.Anonymous):
+            name = str(node.name).lower()
+            if name in _NONDETERMINISTIC_NAMES or any(part in name for part in _NONDETERMINISTIC_PARTS):
+                return False
     return True
 
 
@@ -134,6 +144,8 @@ def _cached(store: Store, entry: dict[str, Any]) -> dict[str, Any] | None:
     rec = store.load_receipt(entry["receipt"]) if entry.get("receipt") else None
     if not rec or rec.get("status") not in ("ok", "warn"):   # warn = ran, with result-guard data warnings
         return None
+    if rec.get("sql_hash") != entry.get("sql_hash") or rec.get("connection") != entry.get("connection"):
+        return None   # not the receipt of this query (never hand back another query's result)
     out = {"cached": True, "receipt_id": rec.get("receipt_id"), "ran_at": rec.get("created_at") or entry.get("at"),
            "columns": rec.get("columns"), "preview": rec.get("preview"), "truncated": rec.get("truncated"),
            "rows": (rec.get("actual") or {}).get("rows")}
@@ -142,6 +154,21 @@ def _cached(store: Store, entry: dict[str, Any]) -> dict[str, Any] | None:
         if rec.get(key) is not None:
             out[key] = rec[key]
     return out
+
+
+def _metadata_bytes(engine: Engine, tables: list[str]) -> int | None:
+    """The size of what the query reads when the estimate has no byte count (count(*), constants): the sum of
+    the referenced tables from metadata, 0 for a query without tables, None when a table's size is unknown."""
+    total = 0
+    for ref in tables:
+        try:
+            info = engine.table_info(ref)
+        except Exception:  # metadata must never break a run
+            return None
+        if info is None or info.bytes is None:
+            return None
+        total += int(info.bytes)
+    return total
 
 
 def check(settings: Settings, engine: Engine, sql: str, *, connection: str, sql_hash: str, kind: str,
@@ -156,7 +183,6 @@ def check(settings: Settings, engine: Engine, sql: str, *, connection: str, sql_
     ident = current()
     now = now_utc()
     entries = read_ledger(store)
-    mine = _mine(entries, ident)
     statement = classify(sql, dialect_for(engine.name))
     tables = statement.tables
     info: dict[str, Any] = {"agent": ident.agent}
@@ -208,7 +234,8 @@ def check(settings: Settings, engine: Engine, sql: str, *, connection: str, sql_
         if len(same) >= budget.max_repeats:
             last = same[-1]
             window = f"{len(same)} times in the last {budget.repeat_window_min:g} minutes"
-            cheap = (cost is not None and cost <= REPEAT_FREE_USD and bytes_ is not None and bytes_ <= REPEAT_FREE_BYTES)
+            size = bytes_ if bytes_ is not None else _metadata_bytes(engine, tables)
+            cheap = cost is not None and cost <= REPEAT_FREE_USD and size is not None and size <= REPEAT_FREE_BYTES
             if cheap:
                 info["note"] = f"ran {window}; allowed because it is cheap"
             elif version is not None and last.get("data_version") == version:
@@ -230,7 +257,7 @@ def check(settings: Settings, engine: Engine, sql: str, *, connection: str, sql_
     # 3. spending fast
     if budget.velocity_usd > 0:
         since = now - timedelta(minutes=budget.velocity_window_min)
-        recent = _usd([e for e in mine if e["_at"] >= since])
+        recent = _velocity_spent(entries, ident, since)
         lifted = approved_at is not None and approved_at >= since
         if recent + (cost or 0.0) > budget.velocity_usd and not lifted:
             return stop("needs_approval", "velocity",
@@ -261,7 +288,7 @@ def caller_status(settings: Settings) -> dict[str, Any]:
         "agent_spent_today_usd": _usd([e for e in entries if e.get("agent") == ident.agent
                                        and e["_at"].date() == today]),
         "agent_day_limit_usd": agent_limit(settings, ident.agent),
-        "velocity": {"spent_usd": _usd([e for e in _mine(entries, ident) if e["_at"] >= since]),
+        "velocity": {"spent_usd": _velocity_spent(entries, ident, since),
                      "limit_usd": budget.velocity_usd or None, "window_min": budget.velocity_window_min},
         "repeat_guard": {"max_repeats": budget.max_repeats or None, "window_min": budget.repeat_window_min},
     }
@@ -290,7 +317,9 @@ def spend(settings: Settings, by: str = "agent", days: int = 7) -> dict[str, Any
         if by == "day":
             keys = [e["_at"].date().isoformat()]
         elif by == "table":
-            keys = list(e.get("tables") or []) or ["(unknown)"]
+            keys = list(e.get("tables") or []) or ["(none)" if "tables" in e else "(unknown)"]
+        elif by in ("session", "task") and e.get("agent"):
+            keys = [str(e.get(by) or "(none)")]   # written by this version: the call simply had no session/task
         else:
             keys = [str(e.get(by) or "(unknown)")]
         share = 1.0 / len(keys)
@@ -308,6 +337,9 @@ def spend(settings: Settings, by: str = "agent", days: int = 7) -> dict[str, Any
     if by == "table":
         notes.append("A query that reads several tables is split evenly between them; executions count every "
                      "query that read the table.")
+    if any(g[by] == "(none)" for g in rows):
+        notes.append("(none): queries that read no table." if by == "table" else
+                     f"(none): calls without a {by} (CLI calls get one only from GULLIVER_{by.upper()}).")
     if any(g[by] == "(unknown)" for g in rows):
         notes.append("(unknown): ledger lines written before Gulliver recorded this field.")
     return {"status": "ok", "by": by, "days": days, "since": first.isoformat(), "rows": rows, "total": total,
@@ -335,6 +367,40 @@ def render_spend(result: dict[str, Any], fmt: str = "markdown") -> str:
     return "\n".join(lines) + "\n"
 
 
+def _when(text: str | None) -> datetime | None:
+    if not text:
+        return None
+    try:
+        dt = parse_iso(str(text))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _born(kind: str, path: Path) -> datetime | None:
+    """When Gulliver says it wrote this receipt or approval: the latest timestamp the file claims (its id, its
+    created_at / approved_at). None when it claims none."""
+    times: list[datetime] = []
+    parts = path.stem.split("-")
+    if len(parts) >= 3:
+        try:
+            times.append(datetime.strptime(parts[1] + parts[2], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc))
+        except ValueError:
+            pass
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if isinstance(data, dict):
+        for field_name in ("created_at", "approved_at"):
+            when = _when(data.get(field_name))
+            if when is not None:
+                times.append(when)
+    if kind == "approval" and not (isinstance(data, dict) and data.get("approved_at")):
+        return None
+    return max(times) if times else None
+
+
 def audit_verify(settings: Settings, head: str | None = None) -> dict[str, Any]:
     """Recompute the hash chains and compare every receipt and approval with the hash written for it."""
     store = Store(settings.state_dir)
@@ -360,8 +426,27 @@ def audit_verify(settings: Settings, head: str | None = None) -> dict[str, Any]:
             problems.append(f"{kind} {item_id} was changed after Gulliver wrote it")
         else:
             checked += 1
-    unaudited = sorted(f"{kind} {p.stem}" for kind, folder in folders.items() if folder.is_dir()
-                       for p in folder.glob("*.json") if (kind, p.stem) not in latest)
+    start = min([w for w in (_when(ledger["first_at"]), _when(trail["first_at"])) if w], default=None)
+    unaudited: list[str] = []
+    for kind, folder in folders.items():
+        if not folder.is_dir():
+            continue
+        for p in sorted(folder.glob("*.json")):
+            if (kind, p.stem) in latest:
+                continue
+            born = _born(kind, p)
+            if start is not None and (born is None or born >= start):
+                # written after the trail existed, yet the trail never saw it: added by hand (or the trail lost it)
+                problems.append(f"{kind} {p.stem} has no audit entry although it was written after the audit "
+                                "trail started (added by hand, or audit.jsonl was removed or cut)")
+            else:
+                unaudited.append(f"{kind} {p.stem}")
+    for chain in (ledger, trail):
+        late = [t for t in chain["legacy_at"] if start is not None and (_when(t) or start) >= start]
+        if late:
+            problems.append(f"{len(late)} {chain['file']} line(s) have no hash although they are newer than the "
+                            "chain (the hashes were stripped?)")
+            chain["legacy"] -= len(late)
     if head and head not in ledger["hashes"] and head not in trail["hashes"]:
         problems.append(f"the head {head[:16]}... you kept is no longer in either chain: entries up to it were "
                         "changed or removed")
@@ -370,11 +455,19 @@ def audit_verify(settings: Settings, head: str | None = None) -> dict[str, Any]:
         warnings.append(f"{ledger['legacy'] + trail['legacy']} line(s) were written before the hash chain existed "
                         "and cannot be checked")
     if unaudited:
-        warnings.append(f"{len(unaudited)} file(s) have no audit entry (older than the chain, or added by hand)")
+        warnings.append(f"{len(unaudited)} file(s) have no audit entry and are older than the audit trail")
     notes = [] if audit._key() else [
         "No GULLIVER_AUDIT_KEY: anyone who can write .gulliver can rebuild the chain. Keep the heads somewhere "
         "else, or set a key the agent cannot read."]
     status = "fail" if problems else ("warn" if warnings else "ok")
+    if problems:
+        next_step = "Something in .gulliver changed after Gulliver wrote it: tell the human which entries."
+    elif warnings:
+        next_step = ("Nothing Gulliver can check was changed, but some entries cannot be checked (see warnings): "
+                     "tell the human. Keep the two head hashes (gulliver audit verify --head <hash>).")
+    else:
+        next_step = ("Intact. Keep the two head hashes to prove later that nothing before them changed "
+                     "(gulliver audit verify --head <hash>).")
     return {
         "status": status,
         "problems": problems,
@@ -385,7 +478,5 @@ def audit_verify(settings: Settings, head: str | None = None) -> dict[str, Any]:
                      "unaudited": unaudited[:20]},
         "keyed": bool(audit._key()),
         "checked_at": iso(now_utc()),
-        "next_step": ("Something in .gulliver changed after Gulliver wrote it: tell the human which entries."
-                      if problems else "Intact. Keep the two head hashes to prove later that nothing before them "
-                                       "changed (gulliver audit verify --head <hash>)."),
+        "next_step": next_step,
     }

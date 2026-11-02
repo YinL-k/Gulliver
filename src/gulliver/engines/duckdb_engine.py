@@ -183,11 +183,10 @@ class DuckDBEngine(Engine):
                 literals = [a for a in node.this.iter_expressions() if isinstance(a, exp.Literal) and a.is_string]
                 if len(literals) != 1:
                     return None
-                path = literals[0].this
-                files = sorted(glob.glob(path)) if any(ch in path for ch in "*?[") else [path]
-                if not files or not all(os.path.isfile(f) for f in files):
+                file_stamps = _file_stamps(literals[0].this)
+                if file_stamps is None:
                     return None
-                stamps += [_stamp(f) for f in files]
+                stamps += file_stamps
                 continue
             if node.catalog and node.catalog.lower() != str(main_db).lower():
                 return None
@@ -195,6 +194,19 @@ class DuckDBEngine(Engine):
                                     [node.name]).fetchone()
             if view:
                 return None
+            query = ("SELECT 1 FROM duckdb_tables() WHERE lower(database_name) = lower(?) "
+                     "AND lower(table_name) = lower(?)")
+            params: list[Any] = [str(main_db), node.name]
+            if node.db:
+                query += " AND lower(schema_name) = lower(?)"
+                params.append(node.db)
+            if self.con.execute(query, params).fetchone() is None:
+                # not a table of this database file: a replacement scan (FROM 'x.parquet') reads the file itself
+                file_stamps = _file_stamps(node.name) if not node.db else None
+                if file_stamps is None:
+                    return None
+                stamps += file_stamps
+                continue
             uses_db = True
         if uses_db:
             stamps += [_stamp(self.path), _stamp(self.path + ".wal")]
@@ -298,6 +310,14 @@ class DuckDBEngine(Engine):
 
         method = "bernoulli" if method == "bernoulli" else "system"
         return f"TABLESAMPLE {percent_text(fraction)}% ({method}, {int(seed)})"
+
+
+def _file_stamps(path: str) -> list[str] | None:
+    """Stamps of the local file(s) a path or glob names; None when any is missing or not a plain local file."""
+    files = sorted(glob.glob(path)) if any(ch in path for ch in "*?[") else [path]
+    if not files or not all(os.path.isfile(f) for f in files):
+        return None
+    return [_stamp(f) for f in files]
 
 
 def _stamp(path: str) -> str:

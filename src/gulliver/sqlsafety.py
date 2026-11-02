@@ -44,7 +44,9 @@ class Statement:
 
     @property
     def sql_hash(self) -> str:
-        return sql_fingerprint(self.select.sql(dialect=self.dialect) if self.select is not None else self.sql)
+        # comments are dropped: the same query with "-- retry 2" is the same query (loop guard, approvals)
+        return sql_fingerprint(self.select.sql(dialect=self.dialect, comments=False)
+                               if self.select is not None else self.sql)
 
     def public(self) -> dict:
         out = {"kind": self.kind, "tables": self.tables}

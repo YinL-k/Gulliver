@@ -170,7 +170,7 @@ def approval_probe(settings: Any, sql: str, connection: str | None = None,
         return None
     if store.spent_today()["usd"] + cost > budget.day_usd:
         return None
-    if store.find_approval(pre["sql_hash"], conn.name) is not None:
+    if store.find_approval(pre["sql_hash"], conn.name, cost=cost) is not None:
         return None
     probe = {"ask": True, "cost_usd": cost, "sql_hash": pre["sql_hash"], "connection": conn.name,
              "rehearsal_id": (rehearsal or {}).get("receipt_id")}

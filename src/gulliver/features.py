@@ -60,7 +60,7 @@ def _gated_run(settings: Settings, conn_name: str, engine: Engine, sql: str, pur
     cost = estimate.cost_usd
     if cost is not None and cost > settings.budget.approval_over_usd:
         sql_hash = sql_fingerprint(sql)
-        if store.find_approval(sql_hash, conn_name) is None:
+        if store.find_approval(sql_hash, conn_name, cost=cost) is None:
             rec = {"action": purpose, "status": "needs_approval", "connection": conn_name, "engine": engine.name,
                    "sql": sql, "sql_hash": sql_hash, "estimate": estimate.as_dict(),
                    "gate": {**gate, "cost_for_gate_usd": cost}}
