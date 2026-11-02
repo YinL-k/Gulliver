@@ -1,4 +1,4 @@
-## A stronger read-only gate
+# A stronger read-only gate
 
 **The problem.** "Only SELECT" is not the same as "read-only". A single SELECT can stop other people's sessions
 (`pg_terminate_backend`), switch a read-only session back to read-write (`set_config('default_transaction_read_only', 'off', false)`),
@@ -43,7 +43,7 @@ So a file outside the allowed folders fails inside DuckDB itself, even for SQL t
 the agent cannot `SET` it back. Parquet and CSV files in the database folder or the current folder keep working
 as before.
 
-### Settings (per connection, set by the human)
+## Settings (per connection, set by the human)
 
 ```toml
 [connections.lake]
@@ -58,7 +58,7 @@ sandbox = true                          # false turns off the engine sandbox (th
 Relative paths resolve against the folder Gulliver runs in. `allow_functions` also works for Postgres,
 BigQuery and Snowflake connections (for example `["nextval"]`).
 
-### Example
+## Example
 
 ```console
 $ gulliver --dsn demo.duckdb preflight "select * from read_csv('/etc/passwd')" --json
@@ -73,9 +73,9 @@ $ gulliver --dsn demo.duckdb preflight "select * from read_csv('/etc/passwd')" -
 }
 ```
 
-### `gulliver selftest security`
+## `gulliver selftest security`
 
-Runs the bypass test set that ships with Gulliver (`src/gulliver/security_corpus.toml`, more than 130 cases:
+Runs the bypass test set that ships with Gulliver (`src/gulliver/security_corpus.toml`, more than 150 cases:
 known bypasses that must be refused with the right code, and ordinary SQL such as `date_trunc`, `coalesce`,
 `regexp_*` and `read_parquet` on allowed paths that must stay allowed). Then it opens the connection (DuckDB; an
 in-memory DuckDB for other engines) and checks the sandbox live: external access off, extension auto-load off,
@@ -84,18 +84,19 @@ settings locked, and a temporary file outside `allowed_paths` refused by DuckDB 
 ```console
 $ gulliver selftest security
 Gulliver security selftest: ok
-bypass test set: 132/132 cases as expected
+bypass test set: 151/151 cases as expected
 DuckDB sandbox on 'default':
   ok      external access off: enable_external_access = false
   ok      extension autoload off: autoload_known_extensions and autoinstall_known_extensions
   ok      settings locked: SET is refused (lock_configuration)
+  ok      allowed folders are narrow: no allowed folder is '/', the home folder or above it
   ok      file outside allowed_paths is refused by DuckDB: Permission Error: Cannot access file "/tmp/gulliver-selftest-.../outside.csv" - file system operations are disabled by configuration
 ```
 
 Exit code 0 when everything passes, 4 when a case or a sandbox check fails (`status: fail`). `--json` prints
 the full result; `--corpus FILE` runs your own cases in the same format.
 
-### Guarantees and limits
+## Guarantees and limits
 
 - Every SQL text that reaches an engine through Gulliver is checked: preflight, rehearse, run, diff, check,
   incremental savings and translate `--check`. Blocks have `status: block` and `statement.code`.
@@ -112,25 +113,3 @@ the full result; `--corpus FILE` runs your own cases in the same format.
 folder, read remote URLs, or auto-load extensions, unless the human sets `allowed_paths` / `allow_remote` (or
 `sandbox = false`). Queries that call the functions above are now refused; `allow_functions` lifts that per
 connection.
-
-## CHANGELOG
-
-- **Security: stronger read-only gate.** SELECTs that stop sessions, change settings or locks, run SQL hidden in
-  strings, or read files and URLs are refused with codes GS001-GS004, in every dialect. DuckDB connections are
-  sandboxed in the engine (`allowed_directories`, no external access, no extension auto-load, locked settings).
-  New per-connection settings `allowed_paths`, `allow_remote`, `allow_functions` and `sandbox`. New
-  `gulliver selftest security` runs the published bypass test set (130+ cases) and checks the sandbox live.
-  Threat model in SECURITY.md. **Breaking:** DuckDB can no longer read files outside the database folder and the
-  current folder unless `allowed_paths` says so.
-
-## AGENTS
-
-Row for the tools table (CLI only, no MCP tool):
-
-| (human) | `gulliver selftest security --json` | check the read-only gate itself: the bypass test set and the DuckDB sandbox (`fail` if a check fails) |
-
-Bullet for "Rules you cannot change":
-
-- SQL that calls a side-effect function, runs SQL from a string, or reads a file or URL outside the allowed
-  folders is blocked with `statement.code` GS001-GS004. Rewrite it to read the tables directly; do not work
-  around it. Only the human can change `allowed_paths`, `allow_remote` and `allow_functions`.

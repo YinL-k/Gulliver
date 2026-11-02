@@ -1,4 +1,4 @@
-## Test every rewrite on generated edge cases: `gulliver fix --verify`
+# Test every rewrite on generated edge cases: `gulliver fix --verify`
 
 `gulliver fix` labels each rewrite: `same` (proven from the column types), `assumes` (same rows *if* the column
 is a DATE or a TIMESTAMP without time zone), `nulls` (NOT IN → NOT EXISTS) or `changes` (on purpose). Labels are
@@ -8,7 +8,7 @@ data that breaks rewrites, and shows you the rows when they disagree.
 Rewriters usually ask you to trust them. SQL linters have shipped auto-fixes that changed query results, and
 LLM rewriters give no guarantee at all. `--verify` tests each rewrite and gives you a counterexample you can run.
 
-### Commands
+## Commands
 
 ```bash
 gulliver fix "SQL" --verify                       # 200 cases, seed 0
@@ -22,7 +22,7 @@ MCP: `gulliver_fix(sql, verify=true, cases=200, seed=0, timezone=null)`.
 `gulliver_preflight` runs a quick check (40 cases, at most about 2 seconds) on the `autofix` it hands over, and
 reports it in `autofix.verified`.
 
-### Example
+## Example
 
 ```text
 $ gulliver fix --mode all --verify \
@@ -67,7 +67,7 @@ without an error), `original_failed` and `weak` (when the original failed on mor
 `invalid_cases` (cases that could not be built or took too long), `seed`, `schema` (the types used), `schema_source` (`metadata`, `inferred`
 or both), `semantics: "DuckDB semantics"` and `notes`.
 
-### What the generated data contains
+## What the generated data contains
 
 Each case is 0, 1, 2, 3, 5, 8, 13 or 50 rows per table. Values are seeded draws from edge-case pools: NULL,
 duplicate values and duplicate rows, 0, -1, the integer limits (of the column's type when it is narrower than
@@ -85,7 +85,7 @@ SUM ...). A column read through a CTE or a derived table (`with x as (select ts 
 through `select *` and aliases) is followed back to its base table. A column the inference missed is added when
 the engine reports it missing.
 
-### Guarantees
+## Guarantees
 
 - **Labels never move up.** A test is not a proof: an `assumes` or `nulls` change with zero counterexamples stays
   `assumes` or `nulls`, with `"no difference found in N generated cases (DuckDB semantics); a test, not a proof"`.
@@ -104,7 +104,7 @@ the engine reports it missing.
   were (`both_failed`, and in `meaning`). Each query runs on fresh tables after one fails, so a failing query
   never makes the next one fail.
 
-### Limits
+## Limits
 
 - **DuckDB semantics.** BigQuery, Snowflake and Postgres SQL is translated to DuckDB first. If the translator
   warns, or the query uses a function it does not know, verification is skipped rather than testing a different
@@ -120,16 +120,3 @@ the engine reports it missing.
   date-like columns are tried in several types. Pass a connection (`--dsn` / `gulliver.toml`) for real types.
 - **Small data.** Up to 50 rows per table finds NULL, duplicate, boundary and time-zone bugs. It does not find
   bugs that need large data or rare values outside the pools.
-
-## CHANGELOG
-
-- `gulliver fix --verify` (MCP `gulliver_fix(verify=true)`): tests every rewrite on seeded, generated edge-case
-  tables in a private in-memory DuckDB (NULLs, duplicates, date boundaries, infinity, daylight-saving jumps) and
-  returns a shrunk, runnable counterexample when rows differ. Options `--cases`, `--seed` and `--timezone`. A
-  counterexample against a `same` rewrite drops that change and warns; labels are never promoted. Preflight's
-  `autofix` now carries a quick `verified` block. The `nulls` label now also says a NULL in the outer column
-  changes the result (the test found that case).
-
-## AGENTS
-
-| `gulliver_fix` (`verify=true`) | `gulliver fix "SQL" --verify --json` | test each rewrite on generated edge-case data; read `changes[].verified_on_generated_data` and `counterexample`; a `dropped` change is a Gulliver bug |

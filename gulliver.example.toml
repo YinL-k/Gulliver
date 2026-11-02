@@ -7,6 +7,16 @@ default_connection = "local"
 engine = "duckdb"
 path = "warehouse.duckdb"
 # allow_write = true        # a human must set this before CREATE/INSERT ... SELECT can run
+# allowed_paths = ["data", "/srv/lake"]   # folders DuckDB may read (default: database folder + current folder)
+# allow_remote = ["s3://my-bucket/"]      # or true for any URL (default false)
+# allow_functions = ["read_text"]         # lift the GS name check for these functions
+# sandbox = true                          # false turns off the DuckDB engine sandbox (the parser still checks)
+
+# [connections.local.policy]              # result guard (default: secrets masked, personal data flagged)
+# pii = "warn"                            # allow | warn | mask | hash | last4 | deny
+# secrets = "mask"
+# injection = "warn"                      # allow | warn | redact
+# categories = { ssn = "deny", email = "hash" }
 
 [connections.bq]
 dsn = "bigquery://my-gcp-project?location=EU"   # auth: gcloud auth application-default login
@@ -44,7 +54,27 @@ max_bytes = 536870912000      # 500 GiB: hard stop on estimated scan
 max_runtime_s = 900
 day_usd = 10.00               # total per calendar day (UTC), from the local ledger
 max_output_rows = 200         # rows handed back to the agent as a preview
+# max_output_chars = 50000    # characters of preview JSON (0 = no limit)
+# max_cell_chars = 1000       # longer text cells are cut
+# session_usd = 3             # per agent session (0 = off)
+# agent_day_usd = { default = 5, "claude-code" = 10 }   # per agent per day (absent = off)
+# max_repeats = 5             # identical runs on unchanged tables per window before the loop guard blocks
+# repeat_window_min = 30
+# velocity_usd = 2.0          # one agent or session spending faster than this ...
+# velocity_window_min = 10    # ... within this many minutes needs a human approval
 
 [approval]
 channel = "cli"               # cli: a human runs `gulliver approve <receipt_id>`
                               # elicitation: the MCP client asks its user (falls back to cli if it cannot)
+
+# [lint]                      # files mode of `gulliver lint` (CI, pre-commit)
+# disable = ["GV010"]
+# severity = { GV006 = "error" }
+# fail_on = "error"           # error | warn | info | never
+# exclude = ["models/legacy/*"]
+
+# [review]                    # `gulliver review` / the GitHub Action
+# max_increase_pct = 100
+# max_increase_usd = 50       # per month for the whole change
+# runs_per_day = 1
+# fail_on = ["cost", "breaking_with_downstream", "new_lint_error", "superlinear"]

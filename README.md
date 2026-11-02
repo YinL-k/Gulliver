@@ -23,6 +23,8 @@ An open-source MCP server and CLI that gives AI agents a dress rehearsal for SQL
   <a href="#quick-start-2-minutes-no-warehouse-needed">Quick start</a> ·
   <a href="#install-the-mcp-server">Install</a> ·
   <a href="#auto-fix">Auto-fix</a> ·
+  <a href="#guards-for-agents">Guards</a> ·
+  <a href="#in-ci-and-on-pull-requests">CI</a> ·
   <a href="#how-it-compares">Compare</a> ·
   <a href="#faq">FAQ</a> ·
   <a href="#roadmap">Roadmap</a>
@@ -30,9 +32,12 @@ An open-source MCP server and CLI that gives AI agents a dress rehearsal for SQL
 
 <p align="center">Works with <b>Claude Code</b>, <b>Codex</b>, <b>Cursor</b>, <b>Gemini CLI</b>, Claude Desktop, VS Code, Windsurf and any MCP client, on <b>DuckDB</b>, <b>Postgres</b>, <b>BigQuery</b> and <b>Snowflake</b>.</p>
 
-> **New in 0.2.0:** `gulliver_fix` rewrites slow SQL for the agent and labels every change. "Same rows" is only
-> promised when Gulliver has checked the column types. Also new: run it with `npx -y gulliver-mcp`, and the Claude Code
-> plugin installs straight from PyPI. See the [changelog](https://github.com/laaielichter/Gulliver/blob/main/CHANGELOG.md).
+> **New in 0.3.0:** a read-only gate that also blocks side-effect functions, SQL hidden in strings and file
+> access, with DuckDB sandboxed in the engine. A result guard for personal data and prompt injection in rows. A
+> runaway guard for loops and per-agent budgets. Lint for CI (SARIF, pre-commit), `gulliver fix --verify`,
+> `gulliver top`, and `gulliver review` with a GitHub Action. **One breaking change:** DuckDB can no longer read
+> files outside the database folder and the current folder unless you allow them
+> ([details](#safety-model)). See the [changelog](https://github.com/laaielichter/Gulliver/blob/main/CHANGELOG.md).
 
 ![Gulliver rehearses a self-join on 1%, 3% and 10% of a 5-million-row table, predicts about 120 million output rows, then rewrites a date filter with the same rows](https://raw.githubusercontent.com/laaielichter/Gulliver/main/docs/demo.svg)
 
@@ -54,9 +59,9 @@ Gulliver sits between the agent and the warehouse:
 | Step | Tool | What happens |
 |---|---|---|
 | 1 | `gulliver_inspect` | Which tables are big? Rows, bytes, partitions, columns. Metadata only, free. |
-| 2 | `gulliver_preflight` | Bytes, rows and money **before** running, plus **scale lint** (13 rules) and the budget gate. When a safe rewrite exists, the answer already contains the fixed SQL (`autofix`). |
+| 2 | `gulliver_preflight` | Bytes, rows and money **before** running, plus **scale lint** (15 rules), the read-only gate and the budget gate. When a safe rewrite exists, the answer already contains the fixed SQL (`autofix`). |
 | 3 | `gulliver_rehearse` | Runs the query on 1%, 3% and 10% samples, fits a growth curve and **predicts the full run** with a confidence range. Catches joins that multiply rows. |
-| 4 | `gulliver_run` | Runs the full query only inside the budget. Otherwise answers `needs_rehearsal` or `needs_approval`. |
+| 4 | `gulliver_run` | Runs the full query only inside the budget. Otherwise answers `needs_rehearsal` or `needs_approval`. The rows come back marked as untrusted data, with secrets masked and personal data flagged. |
 | 5 | `gulliver_receipt` | Markdown proof for the human: what was estimated, rehearsed, approved and run, and predicted vs actual. |
 
 Every answer has a `status` and a `next_step`, so even small models know what to do next.
@@ -64,9 +69,20 @@ Every answer has a `status` and a `next_step`, so even small models know what to
 Gulliver does not only say no. `gulliver_fix` **rewrites the SQL for the agent** and labels every change.
 `same` (exactly the same rows) is only claimed when Gulliver has checked the column types on the connection;
 everything else (`assumes`, `nulls`, `changes`) needs `mode=all` and says what may differ. With a connection it
-estimates the old and the new query side by side, so nobody has to trust the saving blindly.
+estimates the old and the new query side by side, so nobody has to trust the saving blindly. With `--verify` it
+also tests every rewrite on generated edge-case data and shows a counterexample when the rows differ.
 
-And for the pipeline around the query (details in [Pipeline tools](#pipeline-tools)):
+Agents also fail in ways that have nothing to do with size. Gulliver guards those too (details in
+[Guards for agents](#guards-for-agents)):
+
+| Guard | Problem it solves |
+|---|---|
+| Read-only gate | "Only SELECT" is not read-only: a SELECT can stop sessions, run SQL hidden in a string, or read `~/.aws/credentials`. Refused with codes GS001-GS004; DuckDB is also sandboxed in the engine. |
+| Result guard | Rows with emails, card numbers or API keys land in the model's context, and text in a row can carry instructions. Secrets are masked, personal data is flagged, rows are marked `untrusted: true`. |
+| Runaway guard | An agent re-runs the same expensive query in a loop, or one agent spends the team's daily budget. Loops are stopped, and each agent and session can get its own budget. |
+
+And for the pipeline around the query (details in [Pipeline tools](#pipeline-tools) and
+[In CI and on pull requests](#in-ci-and-on-pull-requests)):
 
 | Tool | Problem it solves |
 |---|---|
@@ -76,6 +92,8 @@ And for the pipeline around the query (details in [Pipeline tools](#pipeline-too
 | `gulliver_translate` | SQL between DuckDB, Postgres, BigQuery and Snowflake, with warnings and an optional preflight on the target. |
 | `gulliver_incremental` | A model rebuilds everything every run. Is incremental safe, what is the SQL / dbt config, and how many rows does it skip? |
 | `gulliver_check` | Data quality in one cheap scan: unique keys, not null, accepted values, ranges, freshness, row-count jumps. |
+| `gulliver_top` | "Which repeated queries cost the most, and how do I fix them?" Query history grouped by shape, with same-rows fixes priced per month. |
+| `gulliver_review` | "Is this pull request safe to merge?" New lint, breaking changes, downstream impact and cost per month of the changed models. |
 
 ## Quick start (2 minutes, no warehouse needed)
 
@@ -87,6 +105,7 @@ export GULLIVER_DSN=gulliver_demo.duckdb
 gulliver inspect
 gulliver preflight "select country, count(*) from events e join users u on e.user_id = u.user_id group by 1"
 gulliver lint "select * from events e, users u"           # GV003: join without a condition -> blocked
+gulliver preflight "select * from read_csv('/etc/passwd')" # GS004: a file outside the allowed folders -> blocked
 gulliver rehearse "select a.event_id, b.event_id from events a join events b on a.user_id = b.user_id"
 ```
 
@@ -189,22 +208,82 @@ In `~/.gemini/settings.json`, the same `mcpServers` block as for Claude Desktop 
 Every tool is also a CLI command with `--json`, and `gulliver tools --format openai` or `--format gemini` prints
 ready-made function-calling definitions for the OpenAI or Gemini APIs.
 
+### More of MCP than tools
+
+All 16 tool schemas take about 25.6 KB of the agent's context. `gulliver-mcp --toolset core` loads only the
+8 query tools (about 10.9 KB); `--toolset pipeline` loads the pipeline tools; a comma list mixes sets and tool
+names. The server also offers resources (`gulliver://rules`, `gulliver://status`, table metadata, receipts),
+prompts (`safe-query-loop`, `refactor-and-prove`, `make-incremental`), progress during a rehearsal, and a typed
+`outputSchema` on every tool.
+
+A human can let approvals happen in the MCP client instead of the terminal: with
+`[approval] channel = "elicitation"` in `gulliver.toml`, `gulliver_run` shows the human a form (the statement,
+cost and SQL) before it answers `needs_approval`. It is off by default, and the agent cannot fill the form.
+Turn it on only for clients that show these forms to a person. Details:
+[docs/features/mcp-native.md](https://github.com/laaielichter/Gulliver/blob/main/docs/features/mcp-native.md).
+
 ## How it compares
 
-Based on each project's public docs in October 2026; open an issue if something here is wrong or out of date.
+Based on each project's public docs and READMEs in November 2026 (sources below). Gulliver's own numbers were
+measured in this repository. Open an issue if something here is wrong or out of date.
 
-| | Gulliver | cost-guard-mcp | Database MCP servers (MCP Toolbox, vendor MCPs) | dbt-mcp / dbt `--sample` | Altimate Code |
-|---|---|---|---|---|---|
-| Cost estimate before running | ✓ (exact on BigQuery, upper bound on Snowflake, heuristic on DuckDB/Postgres) | ✓ BigQuery, Snowflake, Databricks | limits and timeouts, no estimate | – | FinOps tools (Snowflake-focused) |
-| Rehearse on 1%/3%/10% and predict the full run | ✓ | – | – | dbt only, time windows only | – |
-| Scale lint with an auto-fix that proves "same rows" | ✓ | – | – | – | SQL review |
-| Budget gate + human approval + receipt | ✓ | – | read-only modes | – | – |
-| Impact, drift, data-diff, translate, incremental, checks | ✓ | – | – | lineage | many tools |
-| Engines | DuckDB, Postgres, BigQuery (beta), Snowflake (beta) | BigQuery, Snowflake, Databricks | many | dbt projects | Snowflake, dbt and more |
-| Runs locally, open source | ✓ MIT | ✓ | ✓ | ✓ | ✓ MIT |
+**MCP servers that let agents query databases**
 
-What Gulliver does **not** do: run your pipelines, replace dbt, or give you a hosted service. There is no
-Databricks or ClickHouse engine yet, and BigQuery and Snowflake have only been tested against fakes so far.
+| | Gulliver 0.3 | cost-guard-mcp | Postgres MCP Pro | MCP Toolbox / BigQuery MCP | DBHub | Supabase MCP | Altimate Code |
+|---|---|---|---|---|---|---|---|
+| Cost estimate before running | ✓ labeled exact (BigQuery), upper bound (Snowflake), heuristic (DuckDB, Postgres) | ✓ labeled precise / upper bound / heuristic | EXPLAIN only | – (row and time limits) | – | – | FinOps history (Snowflake-first) |
+| Enforced budget | ✓ per query, day, bytes, runtime, agent, session | ✓ per call | time limit | – | rows, timeout | – | – |
+| Rehearse on samples, predict the full run | ✓ | – | – | – | – | – | – |
+| Auto-fix with a same-rows guarantee | ✓ checked against column types, tested with `--verify` | – | – | – | – | – | anti-pattern rules, no same-rows label |
+| Human approval outside the agent | ✓ CLI, or a form in the MCP client (opt-in) | – | – | – | – | – | for writes |
+| How read-only is enforced | parser + function and file denylist (GS001-GS004), engine sandbox on DuckDB, read-only session | one read-only statement | read-only transaction + parser | read-only tool / IAM | keyword allowlist | a real read-only database user (strongest) | read-only mode |
+| Personal data / prompt injection in results | ✓ mask or flag, `untrusted` envelope, injection scan (patterns) | – | – | – | – | results wrapped with a warning | PII detection before running |
+| Loop and runaway detection | ✓ | – | – | – | – | – | – |
+| Index tuning, health checks | – | – | ✓ | Postgres observability tools | opt-in health check | – | – |
+| Lineage, data diff, drift, incremental, quality checks | ✓ | – | – | – | – | – | lineage and many more tools |
+| Engines | DuckDB, Postgres (tested in CI); BigQuery, Snowflake (beta, tested with fakes) | BigQuery, Snowflake, Databricks | Postgres | many | Postgres, MySQL, MariaDB, SQL Server, Oracle, SQLite | Supabase Postgres | about 10 warehouses |
+| Tool schema in the agent's context | 16 tools, 25.6 KB; `--toolset core` 10.9 KB | 4 tools | 9 tools | ≈19k tokens for 28 tools (measured by DBHub) | ≈1.4k tokens (its own claim) | ≈19k tokens (measured by DBHub) | 100+ tools |
+| Open source | ✓ MIT | ✓ MIT | ✓ MIT | ✓ | ✓ | ✓ | ✓ MIT |
+
+**SQL in CI and on pull requests**
+
+| | Gulliver 0.3 | SQLFluff | Squawk | dbt-costgate | Recce | Datafold |
+|---|---|---|---|---|---|---|
+| Knows table size, partitions and cost | ✓ with a connection | – | – | BigQuery bytes | – | – |
+| SARIF / PR annotations | ✓ SARIF, GitHub, GitLab, JUnit | ✓ SARIF, GitHub, GitLab | ✓ GitHub | Markdown comment | PR comment | PR comment |
+| Inline ignores, per-rule severity | ✓ | ✓ | ✓ | – | – | – |
+| Autofix that keeps the same rows | ✓ same-rows only, checked by re-parsing | style fixes | – | – | – | – |
+| Cost change per PR | ✓ BigQuery exact, other engines estimated | – | – | ✓ BigQuery | – | – |
+| Row growth (fan-out) per PR | ✓ with `--rehearse` | – | – | – | – | – |
+| Downstream impact | ✓ column-level, SQL models and dbt | – | – | – | ✓ lineage diff | ✓ including BI tools |
+| Data diff | ✓ CLI, also across engines | – | – | – | ✓ two builds | ✓ |
+| Price | free | free | free | free | open source + paid cloud | paid |
+
+Where others are ahead today: Postgres MCP Pro does index tuning and health checks; a real read-only database
+user (as Supabase uses) is a stronger guarantee than any parser; SQLFluff checks style and many more dialects;
+Recce and Datafold diff two real builds and Datafold follows lineage into BI tools; DBHub's tool schema is much
+smaller. Gulliver has no Databricks or ClickHouse engine yet, and BigQuery and Snowflake have only been tested
+against fakes.
+
+What Gulliver does **not** do: run your pipelines, replace dbt, or give you a hosted service.
+
+<details>
+<summary>Sources</summary>
+
+[cost-guard-mcp](https://pypi.org/project/cost-guard-mcp/0.5.0/) ·
+[Postgres MCP Pro](https://github.com/crystaldba/postgres-mcp) ·
+[MCP Toolbox](https://github.com/googleapis/mcp-toolbox) ·
+[BigQuery MCP](https://docs.cloud.google.com/bigquery/docs/use-bigquery-mcp) ·
+[DBHub](https://github.com/bytebase/dbhub) and [its schema-size review](https://dbhub.ai/blog/postgres-mcp-server-review-dbhub) ·
+[Supabase MCP](https://supabase.com/docs/guides/ai-tools/mcp) and [defense in depth](https://supabase.com/blog/defense-in-depth-mcp) ·
+[Altimate Code](https://github.com/AltimateAI/altimate-code) ·
+[SQLFluff releases](https://github.com/sqlfluff/sqlfluff/releases) ·
+[Squawk](https://squawkhq.com/docs/rules) ·
+[dbt-costgate](https://pypi.org/project/dbt-costgate/1.0.5/) ·
+[Recce](https://github.com/DataRecce/recce) ·
+[Datafold](https://docs.datafold.com/reference/open_source/)
+
+</details>
 
 ## Engines
 
@@ -241,7 +320,12 @@ rehearse_over_usd = 0.10    # above this a rehearsal is required first
 day_usd = 10.00             # total per day (local ledger)
 max_runtime_s = 900
 max_output_rows = 200       # rows handed back to the agent
+session_usd = 3             # per agent session (optional)
+agent_day_usd = 5           # per agent per day (optional)
 ```
+
+The example file also shows the settings for the read-only gate (`allowed_paths`, `allow_remote`,
+`allow_functions`), the result guard (`policy`), the runaway guard, `[lint]`, `[review]` and `[approval]`.
 
 ### A read-only Postgres role
 
@@ -266,13 +350,38 @@ Credentials never go in the config: Gulliver uses each engine's own environment 
 
 - **Read-first.** Only `SELECT` (and `WITH ... SELECT`) runs by default. `DELETE`, `UPDATE`, `DROP`, `TRUNCATE`,
   `ALTER`, `MERGE`, several statements at once and unparsable SQL are refused by a parser, not a regex.
+- **A SELECT is not automatically safe.** Functions with side effects (`pg_terminate_backend`, `set_config`,
+  `nextval`), SQL hidden in a string (`dblink_exec`, DuckDB `query()`, BigQuery `EXTERNAL_QUERY`) and file or
+  URL access (`pg_read_file`, `read_csv('~/.aws/credentials')`) are refused with codes
+  [GS001-GS004](#scale-lint-rules), anywhere in the statement.
+- **DuckDB is sandboxed in the engine.** Every DuckDB connection runs with `allowed_directories` set to the
+  database folder and the current folder (or `allowed_paths`), external access off, extension auto-loading off
+  and the configuration locked, so the agent cannot `SET` it back. For Postgres, BigQuery and Snowflake the
+  parser is Gulliver's only check, so also use a [read-only role](#a-read-only-postgres-role).
+  `gulliver selftest security` runs the bypass test set that ships with Gulliver (151 cases) and checks the
+  sandbox live.
 - **Writes need two keys.** `CREATE TABLE ... AS SELECT` and `INSERT ... SELECT` run only when the call says
   `allow_write` **and** a human set `allow_write = true` on that connection. Rehearsals never write.
-- **Budgets fail closed.** Over the per-query, per-day, bytes or runtime limit means `block`. Money above the
-  approval limit needs `gulliver approve <receipt_id>`, a CLI command for humans that is not exposed as an MCP tool.
+- **Budgets fail closed.** Over the per-query, per-day, per-session, per-agent, bytes or runtime limit means
+  `block`. Money above the approval limit needs `gulliver approve <receipt_id>`, a CLI command for humans that is
+  not exposed as an MCP tool (or, when the human turned it on, a form in the MCP client that the agent cannot fill).
+- **Rows are data, not instructions.** Run results are marked `untrusted: true`, secrets are masked, personal
+  data is flagged, and text that reads like instructions to an AI is listed in `data_warnings`.
 - **Engine-side caps** where they exist: BigQuery `maximum_bytes_billed`, Snowflake and Postgres statement timeouts,
   a DuckDB interrupt timer.
-- **Local state only.** Receipts, the spend ledger and approvals live in `./.gulliver/` as JSON. No telemetry.
+- **Local state only.** Receipts, the spend ledger and approvals live in `./.gulliver/` as JSON, hash-chained so
+  `gulliver audit verify` can detect edits. No telemetry.
+
+The threat model is in [SECURITY.md](https://github.com/laaielichter/Gulliver/blob/main/SECURITY.md); the full
+list of what the gate refuses is in
+[docs/features/security.md](https://github.com/laaielichter/Gulliver/blob/main/docs/features/security.md).
+
+> **Breaking change in 0.3.0.** DuckDB connections can no longer read files outside the database folder and the
+> current folder, read remote URLs, or auto-load extensions. If you read Parquet or CSV files elsewhere, add the
+> folder to `allowed_paths` (or the bucket to `allow_remote`) on the connection in `gulliver.toml`. When the
+> database folder or the current folder is `/`, your home folder or above it, it is left out of the default;
+> set `allowed_paths` then. `sandbox = false` turns the engine sandbox off (the parser still checks).
+> Queries that call the refused functions get `block`; `allow_functions` lifts that per connection.
 
 ## How the prediction works
 
@@ -376,6 +485,20 @@ All checks become one aggregate query (one scan), budget-gated like any other. S
 when a check fails, so it drops into CI or an orchestrator. Row-count history is kept per target, so
 `--max-change` catches a load that suddenly lost half its rows.
 
+### Top: the most expensive repeated queries
+
+```bash
+gulliver top                                # the connection's own query history
+gulliver top --source csv:history.csv --days 30
+```
+
+It reads Gulliver's receipts, `pg_stat_statements`, BigQuery `JOBS_BY_PROJECT`, Snowflake `QUERY_HISTORY` or a
+CSV/JSONL export, groups the queries by shape (literals become `?`), and ranks them by cost or runtime. The top
+groups get lint, a rewrite that returns exactly the same rows, and a saving per month labeled `exact` (both
+estimates are BigQuery dry runs) or `heuristic`. Repeated aggregates that could read a summary table are listed
+too. Reading the history is a query like any other, so it goes through the budget gate. Details and limits:
+[docs/features/top.md](https://github.com/laaielichter/Gulliver/blob/main/docs/features/top.md).
+
 ## Auto-fix
 
 ```bash
@@ -412,6 +535,154 @@ Where it pays off: Postgres cannot use a plain index or range partitions on `ts`
 BigQuery, Snowflake and Parquet readers prune best on the raw column. DuckDB already optimizes this case on its
 own tables, so there the estimate stays the same.
 
+### Test every rewrite: `--verify`
+
+Labels are reasoning; `--verify` adds evidence. It runs the original and each rewrite on small generated tables
+full of the data that breaks rewrites (NULLs, duplicates, date boundaries, infinity, daylight-saving jumps) in a
+private in-memory DuckDB, and shows the rows when they disagree, shrunk to a repro you can paste:
+
+```text
+$ gulliver fix --mode all --verify "select o.id from orders o where o.customer_id not in (select customer_id from blocked)"
+GV012 [same rows unless a NULL is involved (in the subquery, or in the outer column)]
+  tested: rows differ in 112 of 200 generated cases
+  repro:  CREATE TABLE "orders" ("id" INTEGER, "customer_id" INTEGER);
+          INSERT INTO "orders" VALUES (0, NULL);
+          ...
+```
+
+A test is not a proof, so labels never move up: an `assumes` change with no counterexample stays `assumes`. A
+counterexample against a `same` rewrite drops that change and says so (that would be a Gulliver bug). It reads
+none of your data and costs nothing. `gulliver_preflight` runs a quick version on the `autofix` it hands over.
+Details: [docs/features/verify.md](https://github.com/laaielichter/Gulliver/blob/main/docs/features/verify.md).
+
+## Guards for agents
+
+These run on every query, with no extra tool call. The settings live in `gulliver.toml`, so only the human
+can change them.
+
+### Read-only gate
+
+```console
+$ gulliver preflight "select * from read_csv('/etc/passwd')" --json
+  "status": "block",
+  "statement": {"kind": "block", "code": "GS004",
+                "reason": "GS004 file-access: read_csv() reads '/etc/passwd', which is outside the allowed folders (/home/me/project). ..."}
+```
+
+| Code | Refuses |
+|---|---|
+| `GS001` server-control | `pg_terminate_backend`, `pg_reload_conf`, `SYSTEM$CANCEL_QUERY`, Snowflake `SYSTEM$` functions not known to be read-only |
+| `GS002` session-state | `set_config`, advisory locks, `nextval`/`setval`, large-object writes, `SELECT ... FOR UPDATE` |
+| `GS003` dynamic-sql | `dblink*`, `query_to_xml*`, DuckDB `query` / `query_table` / `postgres_query`, BigQuery `EXTERNAL_QUERY` |
+| `GS004` file-access | `pg_read_file`, `lo_import`, DuckDB `read_text`, `getenv`, `http_get`; any DuckDB path or URL outside the allowed folders, hidden files (`.env`, `.gulliver/`, also as a glob), `../` and symlinks that lead out |
+
+Names are matched in every part of the statement (CTEs, subqueries, UNION branches, the SELECT of a write),
+after removing quotes, schemas and escapes. On top of that, DuckDB runs in an engine sandbox (see the
+[Safety model](#safety-model)). It is a denylist plus a path allowlist, not a proof: functions defined in the
+database can call anything. Settings per connection: `allowed_paths`, `allow_remote`, `allow_functions`,
+`sandbox`. Details: [docs/features/security.md](https://github.com/laaielichter/Gulliver/blob/main/docs/features/security.md).
+
+### Result guard: personal data, untrusted rows and output size
+
+Every `gulliver_run` preview is checked before the agent or the receipt on disk sees it:
+
+- **Sensitive columns** by name (`email`, `iban`, `card_number`, `password`, `api_key`, Dutch names too),
+  through your SQL (aliases, CTEs, `SELECT *`, a whole row as one value), and by validated value patterns
+  (email, phone, IBAN mod-97, Luhn card numbers, BSN 11-check, IP, JWT, API-key shapes).
+- **Untrusted envelope.** The result has `untrusted: true`. Text that reads like instructions to an AI ("ignore
+  previous instructions", `gulliver_*` tool names, hidden Unicode, base64) is listed in `injection` and
+  `data_warnings`.
+- **Output size.** Long cells are cut (`max_cell_chars`, default 1,000) and a preview over `max_output_chars`
+  (default 50,000) keeps fewer rows plus a `column_summary`, so one wide result does not fill the context.
+
+By default secrets are masked and personal data is shown but flagged (`status: warn`), so existing queries keep
+returning the same values. A `policy` per connection can `allow`, `warn`, `mask`, `hash`, `last4` or `deny` by
+kind, category or column; `deny` blocks at preflight. `gulliver inspect --sensitive` lists the columns that look
+sensitive, and lint rule GV014 flags them without a database. This is a mitigation, not a data-loss prevention
+product: the injection scan uses patterns, so the agent must still treat rows as data. Details:
+[docs/features/guard.md](https://github.com/laaielichter/Gulliver/blob/main/docs/features/guard.md).
+
+### Runaway guard: loops, per-agent and per-session budgets
+
+| Guard | Default | When it trips |
+|---|---|---|
+| `max_repeats` / `repeat_window_min` | 5 runs / 30 min | the same query runs again on tables that did not change: `block`, reason `loop`, with the last result in `cached` (free). When Gulliver cannot tell if the data changed: `needs_approval`, reason `repeat` |
+| `velocity_usd` / `velocity_window_min` | $2 / 10 min | one agent or session spends faster than this: `needs_approval`, reason `velocity` |
+| `session_usd` | off | one session spent its budget: `block`, reason `session_budget` |
+| `agent_day_usd` | off | one agent spent its budget for today: `block`, reason `agent_budget` |
+
+Cheap repeats (under $0.01 and under 1 GB) never count as a loop. The agent comes from MCP `clientInfo`,
+`--agent` or `GULLIVER_AGENT` (set by the human, it wins). Names are self-reported, so per-agent budgets are
+accounting, not a security boundary; the per-query and per-day limits always apply. Queries are tagged in the
+warehouse (Postgres `application_name`, Snowflake `QUERY_TAG`, BigQuery job labels), `gulliver spend --by agent`
+(or `day`, `table`, `session`, `task`) shows who spent what, and `gulliver audit verify` checks the hash chain over
+the ledger, receipts and approvals. Details:
+[docs/features/runaway.md](https://github.com/laaielichter/Gulliver/blob/main/docs/features/runaway.md).
+
+## In CI and on pull requests
+
+### Lint every SQL file
+
+```bash
+gulliver lint models/ queries/                          # every *.sql file, dbt Jinja included, with line:col
+gulliver lint models/ --format sarif -o gulliver.sarif  # GitHub Code Scanning; also github, gitlab, junit, json
+gulliver lint models/ --fail-on warn                    # exit 2 on warnings too (default: errors)
+gulliver fix --check models/ -c warehouse               # exit 2 when a same-rows rewrite exists
+gulliver fix --write models/ -c warehouse               # apply only same-rows rewrites, in place
+gulliver rules                                          # every rule with its severity and autofix
+```
+
+Accept a pattern on purpose with `-- gulliver: ignore GV001 reason` (or `ignore-file`); a typo in the rule list
+ignores nothing and is reported as GV901. Rules, severities and excludes go in `[lint]` in `gulliver.toml`.
+A pre-commit hook ships with the repo:
+
+```yaml
+repos:
+  - repo: https://github.com/laaielichter/Gulliver
+    rev: main            # or a release tag
+    hooks:
+      - id: gulliver-lint
+      - id: gulliver-fix
+        args: [--dsn, warehouse.duckdb]   # column types are needed to prove same-rows rewrites
+```
+
+Fixes are applied as small text edits (comments, line endings and Jinja stay) and are only accepted when the
+edited statement re-parses to exactly the rewritten tree. Details:
+[docs/features/lint-ci.md](https://github.com/laaielichter/Gulliver/blob/main/docs/features/lint-ci.md).
+
+### `gulliver review` and the GitHub Action
+
+```bash
+gulliver review --models models --base origin/main                        # lint + change type + impact
+gulliver --dsn bigquery://my-project review --models models --rehearse    # + cost per month and row growth
+gulliver review --manifest-base prod/manifest.json --manifest-head target/manifest.json
+```
+
+For every changed model it reports new lint, the change type (`cosmetic`, `non_breaking`, `breaking`), the
+downstream models that use a removed or changed column, the scan and money per run and per month before vs
+after, and with `--rehearse` a `superlinear` flag when output rows now grow faster than the data. A `[review]`
+policy maps the flags to ok, warn or block (exit code 2). A missing base ref or base manifest blocks instead of
+reviewing everything.
+
+```yaml
+on: pull_request
+permissions: { contents: read, pull-requests: write }
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: laaielichter/Gulliver@main   # pin a release tag or commit
+        with:
+          models: models
+          # dsn: bigquery://my-project     # cost estimates; credentials come from the job env
+```
+
+The action posts one PR comment and updates it on every push, writes the job summary, and fails the job on
+`block`. Classification is static, so a new LEFT JOIN on a unique key is still called breaking; prove it with
+`gulliver diff`. Details: [docs/features/review.md](https://github.com/laaielichter/Gulliver/blob/main/docs/features/review.md).
+
 ## Scale lint rules
 
 | Rule | Name | Severity |
@@ -429,16 +700,36 @@ own tables, so there the estimate stays the same.
 | GV011 | window-without-partition | warn |
 | GV012 | not-in-subquery | info |
 | GV013 | leading-wildcard-like | info |
+| GV014 | sensitive-column-in-output | info (personal data, masked secret) / warn (unmasked secret) |
+| GV015 | fan-trap | warn |
+| GV900 | parse-error (file lint only) | warn |
+| GV901 | unused-ignore (an unreadable or unused `gulliver: ignore`) | warn |
 
-`gulliver lint` works without any database.
+`gulliver lint` works without any database; `gulliver rules` prints the list with descriptions. GV015 flags
+`SUM`, `AVG` or `COUNT` of a column from the one side of a join like `orders.id = order_items.order_id`, which
+repeats each order once per item; it only fires in that naming pattern, to keep false alarms rare.
+
+The read-only gate uses its own codes. A `GS` finding is always a `block` with the code in `statement.code`:
+
+| Code | Name | Refuses |
+|---|---|---|
+| GS001 | server-control | functions that stop sessions or change the server |
+| GS002 | session-state | functions that change settings, locks or sequences, and `FOR UPDATE` |
+| GS003 | dynamic-sql | functions that run SQL text the parser never sees |
+| GS004 | file-access | file and URL readers outside the allowed folders, hidden files, environment variables |
 
 ## CLI reference
 
 ```
-gulliver status                       connections, budget, spend today
-gulliver inspect [TABLE]              biggest tables, or one table's columns
-gulliver lint SQL [--dialect D]       scale lint only
+gulliver status                       connections, budget, spend today (and your own, under caller)
+gulliver inspect [TABLE] [--sensitive] [--scan N]   biggest tables, one table's columns, or sensitive columns
+gulliver lint SQL [--dialect D]       scale lint of one query
+gulliver lint PATH... [--format text|json|sarif|github|gitlab|junit] [--fail-on error|warn|info|never]
+                      [--exclude GLOB] [--warn-unused-ignores] [--metadata] [-o PATH]   files and folders (CI)
+gulliver rules                        every lint rule: id, name, severity, autofix
 gulliver fix SQL [--dialect D] [--mode safe|all] [--limit N] [-o PATH]   rewrite SQL, say what changes
+gulliver fix SQL --verify [--cases 200] [--seed 0] [--timezone TZ]      test every rewrite on generated data
+gulliver fix --check | --write PATH...                                  same-rows rewrites in files (CI)
 gulliver preflight SQL                estimate + lint + gate, no execution
 gulliver rehearse SQL [--fractions 0.01,0.03,0.1] [--sample largest|all] [--method auto|system|bernoulli]
 gulliver run SQL [--max-rows N] [--allow-write]
@@ -452,13 +743,24 @@ gulliver diff --left SQL --right SQL --key k1,k2 [--right-connection NAME] [--co
 gulliver translate SQL --to D [--from D] [--check] [-o PATH]
 gulliver incremental SQL [--time-column C] [--unique-key K] [--period 1d] [--lookback 1]
 gulliver check TARGET [--where W] [--unique K] [--not-null C] [--accepted C=a|b] [--range C=min:max] [--fresh C=24h] [--min-rows N] [--max-change PCT]
-gulliver tools --format mcp|openai|gemini
-gulliver mcp [--http]                 start the MCP server
+gulliver top [--source auto|receipts|pg_stat_statements|bigquery_jobs|snowflake_history|csv:FILE|jsonl:FILE]
+             [--file PATH] [--days 7] [--limit 20] [--analyze 10] [--rank-by auto|cost|runtime|bytes|calls]
+gulliver review [--models DIR] [--base REF] [--head REF] | [--manifest-base FILE --manifest-head FILE]
+                [--rehearse] [--fail-on KINDS] [--max-increase-pct N] [--max-increase-usd N] [--runs-per-day N]
+                [--format markdown|json] [-o PATH]
+gulliver selftest security [--corpus FILE]   the bypass test set and the DuckDB sandbox
+gulliver spend [--by agent|day|table|session|task|connection|kind] [--days 7] [--format markdown|csv]
+gulliver audit verify [--head HASH]   check the hash chain over ledger, receipts and approvals
+gulliver tools --format mcp|openai|gemini [--toolset core|pipeline|all|NAMES]
+gulliver mcp [--http] [--toolset core|pipeline|all|NAMES]   start the MCP server
 ```
 
-Exit codes: `0` ok, `1` error, `2` blocked, `3` needs rehearsal or approval, `4` a data check failed.
+Exit codes: `0` ok, `1` error, `2` blocked (also: a lint finding at `--fail-on`, a rewrite found by
+`fix --check`, a review that says do not merge), `3` needs rehearsal or approval, `4` a check failed (data
+checks, `selftest`, `audit verify`).
 
-SQL can be an argument, `-f file.sql`, or `-` for stdin. Global flags: `--dsn`, `--config`, `-c NAME`, `--json`.
+SQL can be an argument, `-f file.sql`, or `-` for stdin. Global flags: `--dsn`, `--config`, `-c NAME`,
+`--agent NAME`, `--json`.
 
 ## FAQ
 
@@ -490,6 +792,32 @@ Gulliver uses those for the preflight. On top of that it rehearses on samples to
 grow, rewrites slow SQL with a stated guarantee, enforces a budget, and writes a receipt, in one JSON format across
 four engines.
 
+**Is the read-only gate enough on its own?**
+On DuckDB the engine sandbox does not depend on function names, so a file outside the allowed folders is refused
+by DuckDB itself. On Postgres, BigQuery and Snowflake the parser is Gulliver's only check, and functions or views
+defined in the database can call anything, so keep a read-only database role as well. Run
+`gulliver selftest security` to see the bypass test set pass on your install.
+
+**Will the agent see personal data from my tables?**
+Secrets (passwords, tokens, API keys) are masked by default. Personal data such as emails is shown but flagged
+in `data_warnings`, so queries like "find the customer with this email" keep working. Set a `policy` per
+connection to mask, hash or deny it. Masking happens on the preview after the query ran; the engine still reads
+and bills the data.
+
+**Can text in my data hijack the agent?**
+It can try. Gulliver marks every result `untrusted: true`, lists text that reads like instructions in
+`data_warnings`, and can redact it (`injection = "redact"`). The scan uses patterns, so a determined attacker can
+get past it; the envelope tells the agent to treat rows as data, never as instructions.
+
+**My agent keeps re-running the same query. Can Gulliver stop it?**
+Yes. After `max_repeats` identical runs on tables that did not change, `gulliver_run` returns `block` with
+reason `loop` and the last result for free. Budgets per session and per agent stop one agent from spending the
+whole day's budget.
+
+**Can I use it in CI without a warehouse?**
+Yes. `gulliver lint models/` and `gulliver review` (without `--dsn`) need no database. Add a connection to get
+partition checks, same-rows fixes and cost per pull request.
+
 **Is it ready for production on BigQuery and Snowflake?**
 Not yet. Both are beta and have been tested against fakes, not live accounts. DuckDB and Postgres are tested in CI,
 Postgres against a live server. Reports from real warehouses are very welcome.
@@ -498,8 +826,12 @@ Postgres against a live server. Reports from real warehouses are very welcome.
 
 Ideas for what comes next, not promises. Each one is open for help:
 
-- Live tests for BigQuery and Snowflake, so they can leave beta.
-- More same-rows rewrites in `gulliver_fix`.
+- Live tests for BigQuery and Snowflake, so they can leave beta. The new query tags, history reads for
+  `gulliver top` and review cost estimates on those engines are also tested only against fakes so far.
+- GS005: look up the user functions a Postgres query calls in `pg_proc`, and block those in untrusted languages or
+  with `SECURITY DEFINER`. It needs a live-server test setup.
+- More same-rows rewrites in `gulliver_fix`, and more `--verify` coverage (window functions with ties are skipped today).
+- Stopping the engine job when a rehearsal is cancelled from the MCP client.
 - Databricks and ClickHouse engines.
 
 Have a case where an agent's SQL went wrong at scale? [Open an issue](https://github.com/laaielichter/Gulliver/issues/new/choose).

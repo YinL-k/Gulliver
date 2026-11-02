@@ -1,4 +1,4 @@
-### `gulliver top`: the most expensive repeated queries, with priced fixes
+# `gulliver top`: the most expensive repeated queries, with priced fixes
 
 **The problem.** Teams rarely know which repeated queries burn the money. FinOps dashboards show what ran and what
 it cost, but not the rewrite. Gulliver's other tools look at one new query at a time. `gulliver top` looks back at
@@ -16,7 +16,7 @@ gulliver top --json                            # for agents and scripts
 
 MCP: `gulliver_top` (arguments `source`, `connection`, `path`, `days`, `limit`, `analyze`, `rank_by`, `dialect`).
 
-#### Sources
+## Sources
 
 | source | reads | money per query |
 |---|---|---|
@@ -30,7 +30,7 @@ MCP: `gulliver_top` (arguments `source`, `connection`, `path`, `days`, `limit`, 
 `receipts` for DuckDB. Each history query goes through the same budget gate as every query Gulliver writes itself:
 it is estimated first, can be blocked or need a human approval, and its cost goes into the spend ledger.
 
-#### What it does
+## What it does
 
 1. **Fingerprints.** Literals and parameters (`42`, `'NL'`, `$1`, `@p`, `?`) become `?`, IN lists collapse to one
    `?`, comments and case are ignored. So `WHERE day = '2026-10-01'` and `WHERE day = '2026-10-02'` are one group.
@@ -44,7 +44,7 @@ it is estimated first, can be blocked or need a human approval, and its cost goe
 4. **Summary-table candidates** (`materialize`): aggregates that run at least 10 times a day and scan about the
    same bytes each time. Priced as runs per month x cost per run, minus one refresh a day.
 
-#### Example (BigQuery history, illustrative numbers)
+## Example (BigQuery history, illustrative numbers)
 
 ```text
 2 query shapes (772 calls) from bigquery_jobs, last 7 day(s), ranked by cost. About $2,063.04/month in total.
@@ -78,7 +78,7 @@ The JSON has the same data per group: `fingerprint`, `calls`, `calls_per_day`, `
 (`fixed_sql`, `rules`, `same_result`), `estimate.before/after` and `saving` (`scan_saved_pct`, `per_month_usd`,
 `accuracy`, `basis`).
 
-#### Guarantees
+## Guarantees
 
 - Only rewrites that return exactly the same rows are offered (the `safe` mode of `gulliver fix`). The date
   rewrite needs the column type from the connection's metadata.
@@ -88,7 +88,7 @@ The JSON has the same data per group: `fingerprint`, `calls`, `calls_per_day`, `
 - Every history query is budget-gated, capped by the engine where it can be (BigQuery `maximum_bytes_billed`) and
   recorded in the ledger. Nothing is written.
 
-#### Limits
+## Limits
 
 - Per-month numbers assume the next 30 days repeat the window that was read. `exact` describes the estimates, not
   the future workload. A window shorter than one day (right after a `pg_stat_statements` reset) gets no per-month
@@ -115,14 +115,3 @@ The JSON has the same data per group: `fingerprint`, `calls`, `calls_per_day`, `
   Groups with many literal variants need the filtered columns as GROUP BY keys, and such a refresh can cost more.
   This saving and the rewrite saving for the same query overlap; do not add them up.
 - Query text from history is returned to the agent, and it can contain literal values.
-
-## CHANGELOG
-
-- `gulliver top` / `gulliver_top`: the most expensive repeated queries from Gulliver's receipts,
-  `pg_stat_statements`, BigQuery `JOBS_BY_PROJECT`, Snowflake `QUERY_HISTORY` or a CSV/JSONL file, grouped by
-  shape. The top ones get lint, a same-rows rewrite and a saving per month labeled `exact` or `heuristic`, plus
-  summary-table candidates for repeated aggregates. History queries go through the budget gate.
-
-## AGENTS
-
-| `gulliver_top` | `gulliver top --json` | find the repeated queries that cost the most, with priced same-rows fixes |

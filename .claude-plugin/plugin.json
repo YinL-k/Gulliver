@@ -1,7 +1,7 @@
 {
   "name": "gulliver",
-  "version": "0.2.0",
-  "description": "Test on tiny data before you run on giant data: preflight cost, scale lint with auto-fix, rehearse on 1% -> 10% samples and run inside a budget; plus impact, drift, data-diff, translate, incremental advice and quality checks. MCP server + skill.",
+  "version": "0.3.0",
+  "description": "Test on tiny data before you run on giant data: preflight cost, scale lint with auto-fix, rehearse on 1% -> 10% samples and run inside a budget, with a read-only gate and guards for personal data, prompt injection and query loops; plus impact, drift, data-diff, translate, incremental advice, quality checks, top costly queries and PR review. MCP server + skill.",
   "author": {
     "name": "laaielichter"
   },
@@ -24,10 +24,16 @@
     "duckdb",
     "finops",
     "gemini-cli",
+    "github-action",
     "mcp",
+    "pii",
     "postgres",
+    "pre-commit",
+    "prompt-injection",
     "query-optimization",
+    "sarif",
     "schema-drift",
+    "security",
     "snowflake",
     "sql",
     "sql-linter",

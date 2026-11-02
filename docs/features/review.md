@@ -1,4 +1,4 @@
-## `gulliver review`: a PR gate for SQL models
+# `gulliver review`: a PR gate for SQL models
 
 **The problem.** A pull request that drops a column, adds a join that multiplies rows or doubles a scan looks
 harmless in the diff. Reviewers work out by hand what changed and what breaks, and the cost shows up on next
@@ -21,7 +21,7 @@ For every `.sql` model that changed between a base ref and head, it reports:
 - **Row growth, with `--rehearse`**: both versions run on 1% and 3% samples. If output rows now grow faster than
   the data (exponent above 1.3, and it was not before), it raises a `superlinear` flag.
 
-### Commands
+## Commands
 
 ```bash
 # git: compare the branch with main (only committed changes)
@@ -44,7 +44,7 @@ Exit codes: `0` ok or warn, `1` error, `2` block (do not merge). `--format json 
 instead of markdown. MCP: `gulliver_review` (same arguments; `markdown=true` also returns the comment text), for
 agents to call before they open a PR.
 
-### Policy: `[review]` in gulliver.toml
+## Policy: `[review]` in gulliver.toml
 
 ```toml
 [review]
@@ -62,7 +62,7 @@ covers `breaking_with_downstream`; `new_lint_warning` also covers `new_lint_erro
 `--fail-on`, `--max-increase-pct`, `--max-increase-usd` and `--runs-per-day` override the file for one run;
 `--fail-on none` reports without blocking.
 
-### Example report
+## Example report
 
 ```markdown
 <!-- gulliver-review -->
@@ -88,7 +88,7 @@ covers `breaking_with_downstream`; `new_lint_warning` also covers `new_lint_erro
 
 Each changed model also gets a collapsed details block (reasons, downstream columns, lint fixes, cost per run).
 
-### GitHub Action
+## GitHub Action
 
 `action.yml` at the repository root is a composite action. It installs Gulliver from the action's own source (or
 `package:`), runs the review, writes the report to the job summary, posts or updates **one** PR comment (its own: written by
@@ -120,7 +120,7 @@ jobs:
 Inputs reach the shell only through environment variables (no `${{ }}` inside scripts). On fork PRs the token is
 read-only: the comment step warns and the gate still runs.
 
-### Guarantees
+## Guarantees
 
 - No base, no review: a missing base ref, no shared history (shallow clone) or a missing, empty or foreign base
   manifest gives `block`, never "review everything". A `--models` folder that is in neither the base, the head nor
@@ -130,7 +130,7 @@ read-only: the comment step warns and the gate still runs.
   budget checks and ledger as `gulliver rehearse`.
 - Agents cannot change the policy through MCP; only a human edits `[review]`.
 
-### Limits (honest)
+## Limits (honest)
 
 - Only committed changes are reviewed; uncommitted `.sql` changes are named in the notes.
 - dbt Jinja beyond `ref`, `source`, `config` and `this` is stripped, not compiled: those models are marked
@@ -149,15 +149,3 @@ read-only: the comment step warns and the gate still runs.
 - Manifest mode cannot see renames (a renamed model is removed + added).
 - The SARIF step depends on `gulliver lint --format sarif` for a folder; on versions without it the step warns
   and is skipped.
-
-## CHANGELOG
-
-- `gulliver review` (CLI), `gulliver_review` (MCP) and a GitHub Action (`action.yml`): a PR gate for SQL models.
-  It reports new scale lint, the change type (cosmetic / non_breaking / breaking), the downstream models that
-  break, the scan and money per run and per month before vs after, and with `--rehearse` new superlinear row
-  growth. A `[review]` policy in gulliver.toml maps the flags to ok / warn / block (exit code 2). A missing base
-  ref or base manifest blocks instead of reviewing everything.
-
-## AGENTS
-
-| `gulliver_review` | `gulliver review --models DIR --base origin/main --json` | before opening a PR: new lint, breaking changes, downstream impact and cost delta of the changed models (`block` = do not merge) |

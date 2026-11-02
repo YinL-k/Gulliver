@@ -1,4 +1,4 @@
-## Runaway guard: stop loops, budget each agent and session, tag every query
+# Runaway guard: stop loops, budget each agent and session, tag every query
 
 **The problem.** Agents retry. They re-run the same expensive query across turns, call each other in loops, and
 one busy agent can use up the whole team's daily budget before anyone notices. A daily total reacts too late,
@@ -26,7 +26,7 @@ the velocity check for that query for the length of the window. It only counts a
 when it was given for at least that cost: approving a rehearsal's velocity request does not approve the full
 run. The per-query and per-day limits still apply to everyone.
 
-### Who is asking
+## Who is asking
 
 | | Where it comes from (first one set wins) |
 |---|---|
@@ -37,7 +37,7 @@ run. The per-query and per-day limits still apply to everyone.
 Every ledger line now records `agent`, `session`, `task`, the `tables` read, the `receipt` and the
 `data_version` it saw. `gulliver status` shows the caller's own spend and limits under `caller`.
 
-### Configure
+## Configure
 
 ```toml
 [budget]
@@ -52,7 +52,7 @@ velocity_window_min = 10
 Environment variables: `GULLIVER_SESSION_USD`, `GULLIVER_AGENT_DAY_USD` (one number), `GULLIVER_MAX_REPEATS`,
 `GULLIVER_REPEAT_WINDOW_MIN`, `GULLIVER_VELOCITY_USD`.
 
-### A loop, stopped
+## A loop, stopped
 
 ```console
 $ gulliver run --agent bot --json "select country, count(*) n from users group by 1"   # 6th time in 30 min
@@ -75,7 +75,7 @@ $ gulliver run --agent bot --json "select country, count(*) n from users group b
 }
 ```
 
-### How "the tables did not change" is decided
+## How "the tables did not change" is decided
 
 Gulliver only reuses a result when the engine gives a reliable change signal, and treats everything else as
 unknown (so it asks a human instead of blocking):
@@ -91,7 +91,7 @@ Queries with `NOW()`, `CURRENT_DATE`, `RANDOM()`, `UUID()`, `TABLESAMPLE`, `get_
 `uuidv4()`/`uuidv7()`, `nextval()`, `txid_current()`, or any function whose name contains `current`, `random`,
 `uuid`, `nextval`, `txid`, `sysdate`, `getdate` or `clock`, never count as unchanged.
 
-### Query tags
+## Query tags
 
 Each allowed execution is labelled where the warehouse can store it, so its own billing views show agent spend:
 
@@ -102,7 +102,7 @@ Each allowed execution is labelled where the warehouse can store it, so its own 
 | BigQuery | job labels `gulliver`, `gulliver_agent`, `gulliver_session`, `gulliver_task`, `gulliver_receipt` (in `INFORMATION_SCHEMA.JOBS`) |
 | DuckDB | none (DuckDB keeps no query history to read a tag from) |
 
-### Spend report
+## Spend report
 
 ```console
 $ gulliver spend --by agent            # also: day, table, session, task, connection, kind
@@ -122,7 +122,7 @@ $ gulliver spend --by table --json
 Lines written before this version have no agent and show as `(unknown)`. Current lines without a session or
 task (CLI calls without `GULLIVER_SESSION` / `GULLIVER_TASK`), and queries that read no table, show as `(none)`.
 
-### Audit chain
+## Audit chain
 
 Every ledger line carries the hash of the line before it, and every saved receipt and approval gets a chained
 line in `.gulliver/audit.jsonl` with the sha256 of the file as written.
@@ -142,7 +142,7 @@ a hash that is newer than the chain, are also a `fail`. An approval file without
 ignored by `gulliver_run`, so a hand-written approval approves nothing. Lines and files from before the chain
 existed are counted and reported as a warning; verify only says "Intact" when there are no warnings.
 
-### Guarantees and limits
+## Guarantees and limits
 
 - The agent name and session are self-reported by the client. Per-agent and per-session budgets are
   accounting, not a security boundary: a client can claim another name. `GULLIVER_AGENT` set by the human in
@@ -162,25 +162,3 @@ existed are counted and reported as a warning; verify only says "Intact" when th
 - Repeat counting and spend sums read the local ledger, so they cover this machine's `.gulliver` folder only.
 - Rehearsals are checked against the session, agent and velocity limits once before the ladder starts; the
   loop guard does not apply to them (a rehearsal is already reused by `gulliver_run` for 24 hours).
-
-## CHANGELOG
-
-- Runaway guard: identical runs over `max_repeats` in `repeat_window_min` are blocked when the tables did not
-  change (the last result is returned as `cached`, free) or need approval when Gulliver cannot tell; spending
-  faster than `velocity_usd` per `velocity_window_min` needs approval; new `session_usd` and per-agent
-  `agent_day_usd` budgets. Every ledger line records agent (MCP `clientInfo`, `--agent`, `GULLIVER_AGENT`),
-  session, task (`GULLIVER_TASK`), tables and data version. Queries are tagged (Postgres `application_name`,
-  Snowflake `QUERY_TAG`, BigQuery job labels). New `gulliver spend --by agent|day|table|...` and a hash-chained
-  ledger and receipt trail with `gulliver audit verify`.
-
-## AGENTS
-
-Row for the tools table:
-
-| `gulliver_status` (see `caller`) | `gulliver spend --by agent\|day\|table` | see your own spend and limits; humans get spend per agent, day or table |
-
-Line for "Status values" / "The loop":
-
-- `block` with `reason: loop`: this exact query already ran `max_repeats` times on unchanged tables. Use
-  `cached.preview` (the last result, free); do not retry it. `needs_approval` with `reason: repeat` or
-  `velocity`: tell the human the `receipt_id`. `reason: agent_budget` / `session_budget`: stop and tell the human.

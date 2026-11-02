@@ -1,11 +1,11 @@
-## Lint in CI: files, folders, PR annotations and pre-commit
+# Lint in CI: files, folders, PR annotations and pre-commit
 
 `gulliver lint "SQL"` checks one query. For a repository you want the same checks on every pull request:
 on all `.sql` files and dbt models, with the problem shown on the right line, a way to accept a pattern on
 purpose, and output your CI understands. Other SQL linters check style or DDL; none of them know that a
 `DATE(ts) = ...` filter stops partition pruning, or offer a rewrite that is proven to return the same rows.
 
-### Commands
+## Commands
 
 ```bash
 gulliver lint models/ queries/                          # folders: every *.sql file; files work too
@@ -33,7 +33,7 @@ a bare word, or it ends in `/` or `.sql`, or holds a `/`) switches to files mode
 Exit codes: `0` nothing at or above `fail_on`, `2` at least one finding fails the check (or, for
 `fix --check`, a rewrite is available), `1` a path or the config is wrong.
 
-### Example
+## Example
 
 `models/a.sql` (three statements) and the dbt model `models/sub/m.sql`:
 
@@ -87,7 +87,7 @@ models/a.sql:9:7: GV005 [returns exactly the same rows]
 next: 1 same-rows rewrite(s) available. Run `gulliver fix --write` on these files.
 ```
 
-### How files are read
+## How files are read
 
 - Folders are walked for `*.sql`. Hidden folders, `target/`, `dbt_packages/`, `node_modules/` are skipped
   while walking. `--exclude` and `[lint] exclude` globs apply to named files too, so pre-commit respects them.
@@ -103,7 +103,7 @@ next: 1 same-rows rewrite(s) available. Run `gulliver fix --write` on these file
 - Positions come from the sqlglot tokens of the code a rule is about (the `*`, the join, the filter, the
   `ORDER BY`). The line is reliable; the column is the first token Gulliver can locate for that rule.
 
-### Ignores
+## Ignores
 
 ```sql
 select *  -- gulliver: ignore GV001 we export every column on purpose
@@ -124,7 +124,7 @@ A rule list Gulliver cannot read ignores nothing and is always reported as `GV90
 `ignore(GV001)`). A typo therefore never turns into "ignore every rule".
 `--warn-unused-ignores` also reports ignore comments that no longer ignore anything (`GV901 unused-ignore`).
 
-### Configuration
+## Configuration
 
 ```toml
 [lint]
@@ -138,7 +138,7 @@ warn_unused_ignores = true
 
 `[lint]` applies to files mode only. `gulliver lint "SQL"`, preflight and the run gate are not changed by it.
 
-### Output formats
+## Output formats
 
 | format | for | notes |
 |---|---|---|
@@ -179,7 +179,7 @@ repos:
         args: [--dsn, warehouse.duckdb]   # column types are needed to prove same-rows rewrites
 ```
 
-### Fixes: same rows only
+## Fixes: same rows only
 
 `gulliver fix --check` and `--write` (and the SARIF `fixes`) use only rewrites with the `same` guarantee
 from `gulliver fix`: today that is GV005, a function on a date column turned into a range on the raw column,
@@ -199,7 +199,7 @@ listed as not placed and the file is left alone.
 
 Viewers differ in what they do with SARIF `fixes`; GitHub Code Scanning shows the alert either way.
 
-### GV015 fan-trap (new rule)
+## GV015 fan-trap (new rule)
 
 `SUM`, `AVG` or `COUNT` of a column from the one side of a join like `orders.id = order_items.order_id`
 repeats each order once per item, so the total is multiplied. GV015 (warn) flags it only in this narrow
@@ -211,7 +211,7 @@ join named this way, or a fact-to-dimension lookup where repeating the value is 
 (`sum(p.price) from order_items i join products p on p.id = i.product_id`), is flagged too; ignore it there
 with `-- gulliver: ignore GV015`.
 
-### Limits
+## Limits
 
 - Files mode needs no database. GV004 (missing partition filter) and the same-rows fixes need metadata, so
   pass `--metadata` (lint) or a connection (fix). Metadata is free: no data is read.
@@ -220,16 +220,3 @@ with `-- gulliver: ignore GV015`.
 - The column is approximate for findings about a whole clause (it points at the first token Gulliver can
   locate). Columns count Unicode code points (SARIF `columnKind: unicodeCodePoints`).
 - The MCP tool `gulliver_lint` still takes one SQL string; files mode is CLI only.
-
-## CHANGELOG
-
-- `gulliver lint PATH...`: lint files and folders for CI (multi-statement files, dbt Jinja, line and column on
-  every finding), inline `-- gulliver: ignore GVxxx` / `ignore-file`, `--warn-unused-ignores`, `--fail-on`,
-  `--exclude`, a `[lint]` section in `gulliver.toml`, and output as text, JSON, SARIF 2.1.0 (with same-rows
-  fixes), GitHub annotations, GitLab Code Quality or JUnit. New `gulliver rules`, `gulliver fix --check` /
-  `--write` (same-rows rewrites only, checked by re-parsing), `.pre-commit-hooks.yaml`, and lint rule GV015
-  fan-trap. `gulliver lint "SQL"` is unchanged.
-
-## AGENTS
-
-| (CLI only) | `gulliver lint models/ --json` / `gulliver fix --check models/` | lint every SQL file in a repo with line numbers; list proven same-rows rewrites |
