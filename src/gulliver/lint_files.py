@@ -16,7 +16,7 @@
     re-parsing (the edited statement must parse to the same tree as the fixer's rewrite, or the edit is dropped)
 
 Two meta rules exist only here: GV900 parse-error (a statement Gulliver could not parse, so it was not checked)
-and GV901 unused-ignore (only with --warn-unused-ignores).
+and GV901 unused-ignore (an unreadable rule list always; unused ignores only with --warn-unused-ignores).
 """
 
 from __future__ import annotations
@@ -202,11 +202,15 @@ class Rendered:
     source: str
     regions: list[tuple[int, int, int, int]] = field(default_factory=list)  # (r_start, r_end, s_start, s_end)
 
-    def to_source(self, offset: int) -> int:
-        """Rendered offset -> source offset (inside a replaced Jinja region: its start)."""
+    def to_source(self, offset: int, end: bool = False) -> int:
+        """Rendered offset -> source offset (inside a replaced Jinja region: its start).
+
+        end=True maps the end of a span: an offset right where a Jinja region starts stays before that region
+        (a region that renders to nothing, like {% if %} or {# #}, has r_start == r_end and would otherwise
+        map past the Jinja, so an edit ending there would swallow it)."""
         delta = 0
         for r_start, r_end, s_start, s_end in self.regions:
-            if offset < r_start:
+            if offset < r_start or (end and offset == r_start):
                 break
             if offset < r_end:
                 return s_start
@@ -409,6 +413,7 @@ class FileResult:
     findings: list[FileFinding] = field(default_factory=list)
     ignored: list[FileFinding] = field(default_factory=list)
     fixes: list[FileFix] = field(default_factory=list)
+    bom: bool = False   # the file starts with a UTF-8 BOM (not part of `source`)
 
 
 class _Lines:
@@ -439,24 +444,58 @@ class Directive:
     rules: list[str]    # empty: every rule
     comment_only: bool
     used: set[str] = field(default_factory=set)
+    invalid: str | None = None   # a rule list Gulliver cannot read: the directive ignores nothing
 
 
-def parse_directives(lines: _Lines) -> list[Directive]:
+def _looks_like_rule(word: str, first: bool) -> bool:
+    """A word that was meant as a rule id or name (GV-001, select_star, cartesian_join), not a reason."""
+    import difflib
+
+    if re.match(r"(?i)gv\W*\w", word):
+        return True
+    if not first:
+        return False
+    names = [n for n in {**RULES, **META_RULES}.values()]
+    norm = word.lower().replace("_", "-")
+    return "_" in word or bool(difflib.get_close_matches(norm, names, n=1, cutoff=0.8))
+
+
+def parse_directives(lines: _Lines, code_spans: list[tuple[int, int]] = ()) -> list[Directive]:
+    """`gulliver: ignore` comments. A match inside a SQL token (a string literal, a quoted name) in
+    `code_spans` (source offsets) is not a comment and is skipped."""
     out: list[Directive] = []
+    starts = [a for a, _ in code_spans]
     for m in _DIRECTIVE.finditer(lines.text):
+        i = bisect.bisect_right(starts, m.start()) - 1
+        if i >= 0 and code_spans[i][0] <= m.start() < code_spans[i][1]:
+            continue
         line, col = lines.line_col(m.start())
         rules: list[str] = []
-        for word in re.split(r"[\s,]+", m.group(2).replace("*/", " ").replace("#}", " ").strip()):
-            rid = _rule_id(word) if word else None
+        invalid: str | None = None
+        rest = m.group(2).replace("*/", " ").replace("#}", " ")
+        if rest[:1] and not rest[:1].isspace():
+            invalid = f"write the rules after a space (`gulliver: {m.group(1).lower()} GV001`), not '{rest.strip()}'"
+        words = [w for w in re.split(r"[\s,]+", rest.strip()) if w]
+        if invalid is None and words and words[0].lower() in ("all", "*"):
+            words = []
+        for n, word in enumerate(words if invalid is None else []):
+            rid = _rule_id(word)
             if rid is None:
+                if _looks_like_rule(word, first=n == 0):
+                    invalid = f"unknown rule '{word}' (run `gulliver rules` for the list)"
                 break  # the rest is a free-text reason
+            if rid not in RULES and rid not in META_RULES:
+                invalid = f"unknown rule '{word}' (run `gulliver rules` for the list)"
+                break
             rules.append(rid)
         out.append(Directive(m.group(1).lower(), line, col, rules,
-                             bool(_COMMENT_START.match(lines.line_text(line)))))
+                             bool(_COMMENT_START.match(lines.line_text(line))), invalid=invalid))
     return out
 
 
 def _covers(d: Directive, rule: str) -> bool:
+    if d.invalid is not None:
+        return False
     return not d.rules or rule in d.rules
 
 
@@ -516,6 +555,7 @@ class Metadata:
         self.engine = engine
         self.cache: dict[str, dict | None] = {}
         self.notes: list[str] = []
+        self.missing: list[str] = []   # tables the connection does not have (no metadata for them)
 
     def for_tables(self, refs: Iterable[str]) -> dict[str, dict] | None:
         from .engines import EngineError
@@ -527,6 +567,8 @@ class Metadata:
                 try:
                     info = self.engine.table_info(ref)
                     self.cache[key] = info.as_dict(with_columns=True) if info is not None else None
+                    if info is None:
+                        self.missing.append(ref)
                 except EngineError as exc:
                     self.cache[key] = None
                     self.notes.append(f"{ref}: {exc}")
@@ -620,6 +662,17 @@ def _locate_changes(chunk: Chunk, chunk_sql: str, dialect: str, table_info: dict
 
 
 
+def _has_comment(text: str, tokens: list[Token], start: int, end: int) -> bool:
+    """True when [start, end) holds more than tokens and whitespace (a comment between its tokens)."""
+    inside = [t for t in tokens if t.start >= start and t.end < end]
+    pos = start
+    for t in inside:
+        if text[pos:t.start].strip():
+            return True
+        pos = t.end + 1
+    return bool(text[pos:end].strip())
+
+
 def _place_fix(result: FileResult, rendered: Rendered, lines: _Lines, chunk: Chunk, chunk_sql: str,
                dialect: str, table_info: dict[str, dict] | None) -> None:
     from .fixer import SAME, rewrite
@@ -646,6 +699,8 @@ def _place_fix(result: FileResult, rendered: Rendered, lines: _Lines, chunk: Chu
         return fail("Rewrites overlap; run `gulliver fix` on this statement.")
     if not all(rendered.clean(s, e) for s, e, _ in edits):
         return fail("The rewrite touches dbt Jinja; edit it by hand.")
+    if any(_has_comment(rendered.text, chunk.tokens, s, e) for s, e, _ in edits):
+        return fail("The rewrite would remove a comment inside the changed code; edit it by hand.")
     # Proof that the text edits are the fixer's rewrite: the edited statement parses to the same tree.
     edited = chunk_sql
     for s, e, after in reversed(edits):
@@ -659,7 +714,9 @@ def _place_fix(result: FileResult, rendered: Rendered, lines: _Lines, chunk: Chu
         return fail("The text edit did not reproduce the rewrite exactly; run `gulliver fix` on this statement.")
     placed: list[Edit] = []
     for s, e, after in edits:
-        ss, se = rendered.to_source(s), rendered.to_source(e)
+        ss, se = rendered.to_source(s), rendered.to_source(e, end=True)
+        if rendered.source[ss:se] != rendered.text[s:e]:
+            return fail("The rewrite touches dbt Jinja; edit it by hand.")
         (l1, c1), (l2, c2) = lines.line_col(ss), lines.line_col(se)
         placed.append(Edit(ss, se, l1, c1, l2, c2, rendered.source[ss:se], after))
     notes = [c["note"] for c in changes]
@@ -673,22 +730,28 @@ def lint_file(file: Path, dialect: str = "duckdb", config: LintConfig | None = N
     unused_flag = config.warn_unused_ignores if warn_unused_ignores is None else warn_unused_ignores
     result = FileResult(display_path(file), file)
     try:
-        source = file.read_text(encoding="utf-8")
+        # newline="": keep \r\n so edits and the written file keep the original line endings
+        with open(file, encoding="utf-8", newline="") as fh:
+            source = fh.read()
     except (OSError, UnicodeDecodeError) as exc:
         result.findings.append(FileFinding(result.path, "GV900", config.severity.get("GV900", "error"),
                                            f"Could not read the file: {exc}", "Save it as UTF-8 text.",
                                            1, 1, 1, 1, 0, ""))
         return result
+    if source.startswith("\ufeff"):  # a UTF-8 BOM (Windows editors): not SQL; fix --write puts it back
+        result.bom = True
+        source = source[1:]
     result.source = source
     lines = _Lines(source)
     rendered = render_jinja(source, file.stem.lower())
+    uses_this = bool(THIS_RE.search(source))
     found: list[FileFinding] = []
 
     def add(rule: str, severity: str, message: str, fix: str, r_start: int, r_end: int, statement: int) -> None:
         if rule in config.disable:
             return
         severity = config.severity.get(rule, severity)
-        s, e = rendered.to_source(r_start), rendered.to_source(max(r_end, r_start))
+        s, e = rendered.to_source(r_start), rendered.to_source(max(r_end, r_start), end=True)
         (l1, c1), (l2, c2) = lines.line_col(s), lines.line_col(max(e, s))
         found.append(FileFinding(result.path, rule, severity, message, fix, l1, c1, l2, c2, statement,
                                  lines.line_text(l1).strip()))
@@ -721,7 +784,9 @@ def lint_file(file: Path, dialect: str = "duckdb", config: LintConfig | None = N
                 line = statement_lines[chunk.index]
                 result.skipped.append({"statement": chunk.index, "line": line, "reason": reason or "not a read"})
             continue
-        table_info = metadata.for_tables(statement.tables) if metadata is not None else None
+        # {{ this }} renders to the model's own name, which the warehouse need not have yet
+        refs = [t for t in statement.tables if not (uses_this and t.lower() == file.stem.lower())]
+        table_info = metadata.for_tables(refs) if metadata is not None else None
         try:
             findings: list[Finding] = lint(statement.select, dialect, table_info)
         except Exception as exc:
@@ -734,10 +799,23 @@ def lint_file(file: Path, dialect: str = "duckdb", config: LintConfig | None = N
         if with_fixes and findings:
             _place_fix(result, rendered, lines, chunk, chunk_sql, dialect, table_info)
 
-    directives = parse_directives(lines)
+    code_spans = sorted((rendered.to_source(t.start), rendered.to_source(t.end + 1, end=True))
+                        for chunk in chunks for t in chunk.tokens)
+    directives = parse_directives(lines, code_spans)
     kept, ignored = _apply_ignores(found, directives, lines, statement_lines)
+    # Fixes only for findings that survived [lint] disable and the ignore comments.
+    kept_rules = {(f.statement, f.rule) for f in kept}
+    result.fixes = [x for x in result.fixes if all((x.statement, r) in kept_rules for r in x.rules)]
+    for d in directives:
+        if d.invalid is not None and "GV901" not in config.disable:
+            kept.append(FileFinding(result.path, "GV901", config.severity.get("GV901", "warn"),
+                                    f"This `gulliver: {d.kind}` comment ignores nothing: {d.invalid}.",
+                                    "Use rule ids or names from `gulliver rules`, separated by spaces or commas.",
+                                    d.line, d.col, d.line, d.col, 0, lines.line_text(d.line).strip()))
     if unused_flag:
         for d in directives:
+            if d.invalid is not None:
+                continue
             unused = [r for r in d.rules if r not in d.used] if d.rules else ([] if d.used else ["all rules"])
             if unused and "GV901" not in config.disable:
                 kept.append(FileFinding(result.path, "GV901", config.severity.get("GV901", "warn"),
@@ -839,7 +917,7 @@ def fix_paths(paths: list[str], dialect: str | None = None, config: LintConfig |
             new = apply_edits(res.source, placed)
             if new != res.source:
                 with open(file, "w", encoding="utf-8", newline="") as fh:
-                    fh.write(new)
+                    fh.write(("\ufeff" if res.bom else "") + new)
                 written.append(res.path)
     ready = [x for x in fixes if x.placed]
     unplaced = [x for x in fixes if not x.placed]
@@ -847,18 +925,26 @@ def fix_paths(paths: list[str], dialect: str | None = None, config: LintConfig |
                            "files": len(files), "fixes": [x.as_dict() for x in fixes],
                            "fixable": len(ready), "unplaced": len(unplaced), "written": written}
     if metadata is not None and metadata.notes:
-        out["notes"] = metadata.notes
+        out["notes"] = list(metadata.notes)
+    if metadata is not None and metadata.missing:
+        shown = ", ".join(metadata.missing[:10]) + (" ..." if len(metadata.missing) > 10 else "")
+        out.setdefault("notes", []).append(
+            f"Not found in the connection, so not checked for fixes: {shown}. Pass the warehouse connection "
+            "(--dsn or -c) that has these tables.")
     if metadata is None:
         out.setdefault("notes", []).append("No connection metadata: date rewrites need the column type, so few or no "
                                            "same-rows fixes can be proven.")
+    unchecked = metadata is None or bool(metadata.missing)
     if write:
-        out["status"] = "warn" if unplaced else "ok"
+        out["status"] = "warn" if unplaced or (unchecked and not written) else "ok"
         out["next_step"] = (f"Rewrote {len(written)} file(s) with same-rows changes only. Review the diff and commit."
                             if written else "Nothing to rewrite with a same-rows guarantee.")
     else:
-        out["status"] = "block" if ready else ("warn" if unplaced else "ok")
+        out["status"] = "block" if ready else ("warn" if unplaced or unchecked else "ok")
         out["next_step"] = (f"{len(ready)} same-rows rewrite(s) available. Run `gulliver fix --write` on these files."
                             if ready else "Nothing to rewrite with a same-rows guarantee.")
+    if unchecked and not ready:
+        out["next_step"] += " Some statements could not be checked without table metadata; see notes."
     if unplaced:
         out["next_step"] += f" {len(unplaced)} rewrite(s) could not be placed as exact edits; see fixes[].notes."
     return out

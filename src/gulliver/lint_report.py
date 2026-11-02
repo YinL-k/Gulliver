@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 from urllib.parse import quote
-from xml.sax.saxutils import quoteattr
+from xml.sax.saxutils import quoteattr as _quoteattr
 
 from . import __version__
 from .lint import RULES
@@ -65,7 +66,8 @@ RULE_DOCS: dict[str, tuple[str, str, str, str]] = {
               "Aggregate the many side per key in a subquery before the join.", "none"),
     "GV900": ("warn", "Gulliver could not parse a statement (dialect, or dbt Jinja it cannot render), so it was not "
                       "checked. Only in file lint.", "Set the dialect, or simplify the Jinja.", "none"),
-    "GV901": ("warn", "A `gulliver: ignore` comment that ignores nothing. Only with --warn-unused-ignores.",
+    "GV901": ("warn", "A `gulliver: ignore` comment that ignores nothing: always for an unreadable rule list "
+                      "(unknown rule, `ignore:`), unused ones only with --warn-unused-ignores.",
               "Remove the comment or the rule ids that no longer apply.", "none"),
 }
 
@@ -301,8 +303,20 @@ def to_junit(result: dict[str, Any]) -> str:
     return "\n".join([head, *suites, "</testsuites>"])
 
 
+_XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
+def _xml_safe(text: str) -> str:
+    """XML 1.0 forbids most control characters (a SQL literal can hold them): replace them with U+FFFD."""
+    return _XML_BAD.sub("\ufffd", text)
+
+
+def quoteattr(text: str) -> str:
+    return _quoteattr(_xml_safe(text))
+
+
 def _xml_text(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _xml_safe(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def render_fix_text(result: dict[str, Any]) -> str:
@@ -329,13 +343,25 @@ def render_fix_text(result: dict[str, Any]) -> str:
 def path_mode(values: list[str] | None, flags: bool = False) -> bool:
     """`gulliver lint X`: X is a file or folder (path mode) or one SQL string (unchanged single-SQL lint).
 
-    Path mode when any value exists on disk, when several values are given, or when a path-only flag is used."""
+    Path mode when any value exists on disk, when several values are given, when a path-only flag is used, or
+    when the one value looks like a path (no spaces, and ends in / or .sql or holds a /): a missing or mistyped
+    folder is then reported as not found (exit 1), not linted as SQL."""
     import os
 
     values = values or []
     if any(os.path.exists(v) for v in values if v != "-"):
         return True
+    if len(values) == 1 and _looks_like_path(values[0]):
+        return True
     return len(values) > 1 or (flags and bool(values))
+
+
+def _looks_like_path(value: str) -> bool:
+    v = value.strip()
+    if not v or v == "-" or any(c.isspace() for c in v) or any(c in v for c in "'\"();*=<>,"):
+        return False
+    # one bare word (`models`, `my_models.v2`) is not a SQL statement either
+    return v.endswith(("/", "\\")) or v.lower().endswith(".sql") or "/" in v or bool(re.fullmatch(r"[\w.\-]+", v))
 
 
 def _write_or_print(text: str, output: str | None) -> None:

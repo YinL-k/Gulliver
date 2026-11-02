@@ -350,6 +350,11 @@ def test_lint_metadata_adds_sarif_fixes(demo_db, state, tmp_path, capsys):
     ("select count(distinct o.id) from orders o join order_items i on i.order_id = o.id", False),
     ("select o.id, sum(o.shipping) from orders o join order_items i on i.order_id = o.id and i.n = 1 group by 1",
      False),                                                                                      # extra condition
+    ("select count(u.id) from users u left join events e on u.id = e.user_id where e.user_id is null", False),
+    ("select u.country, count(u.id) from users u left join events e on u.id = e.user_id "
+     "where e.event_id is null and u.country <> 'NL' group by 1", False),                         # anti-join
+    ("select count(u.id) from events e right join users u on u.id = e.user_id where e.user_id is null", False),
+    ("select count(u.id) from users u left join events e on u.id = e.user_id where u.name is null", True),
 ])
 def test_gv015_fan_trap(sql, hit):
     from gulliver.lint import lint
@@ -374,3 +379,109 @@ def test_other_dialects_and_odd_files(tmp_path):
     assert lint_file(_write(tmp_path / "c.sql", "-- only a comment\n")).findings == []
     pg = lint_file(_write(tmp_path / "pg.sql", "select x::date from t limit 1;"), dialect="postgres")
     assert pg.findings == []
+
+
+# -- regressions -----------------------------------------------------------------------------------------
+@pytest.mark.parametrize("tail", ["{% if is_incremental() %} and ts > (select max(ts) from {{ this }}){% endif %}",
+                                  "{# keep this note #}"])
+def test_fix_write_keeps_empty_jinja_right_after_the_edit(demo_db, state, tmp_path, capsys, tail):
+    head = "select user_id from {{ ref('events') }}\nwhere DATE(ts) = '2025-01-03'"
+    f = _write(tmp_path / "m.sql", head + tail + "\nlimit 10\n")
+    assert main(["--dsn", demo_db, "fix", "--write", "m.sql", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["fixes"][0]["edits"][0]["before"] == "DATE(ts) = '2025-01-03'"
+    assert f.read_text() == ("select user_id from {{ ref('events') }}\nwhere ts >= '2025-01-03' AND ts < '2025-01-04'"
+                             + tail + "\nlimit 10\n")
+    assert not any("not found" in n.lower() for n in data.get("notes") or [])   # {{ this }} is the model itself
+
+
+def test_render_jinja_end_offsets_stay_before_an_empty_region():
+    r = render_jinja("a{# x #}b")
+    assert r.text == "ab"
+    assert r.to_source(1) == 8 and r.to_source(1, end=True) == 1
+
+
+@pytest.mark.parametrize("text,config", [
+    ("-- gulliver: ignore GV005 we need DATE() here on purpose\n"
+     "select user_id from events where DATE(ts) = '2025-01-03' limit 10;\n", None),
+    ("-- gulliver: ignore-file\nselect user_id from events where DATE(ts) = '2025-01-03' limit 10;\n", None),
+    ("select user_id from events where DATE(ts) = '2025-01-03' limit 10;\n", '[lint]\ndisable = ["GV005"]\n'),
+])
+def test_fix_respects_ignores_and_disable(demo_db, state, tmp_path, capsys, text, config):
+    f = _write(tmp_path / "a.sql", text)
+    if config:
+        _write(tmp_path / "gulliver.toml", config)
+    assert main(["--dsn", demo_db, "fix", "--check", "a.sql", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["fixes"] == []
+    assert main(["--dsn", demo_db, "fix", "--write", "a.sql"]) == 0
+    assert f.read_text() == text
+
+
+@pytest.mark.parametrize("text", [
+    "-- gulliver: ignore select_star\nselect * from events e, users u;\n",
+    "select * from events e, users u; -- gulliver: ignore GV-001\n",
+    "select * from events e, users u; -- gulliver: ignore GV0O1\n",
+    "-- gulliver: ignore: GV001\nselect * from events e, users u;\n",
+    "-- gulliver: ignore(GV001)\nselect * from events e, users u;\n",
+])
+def test_mistyped_ignore_ignores_nothing_and_is_reported(tmp_path, text):
+    res = lint_file(_write(tmp_path / "a.sql", text))
+    rules_found = {f.rule for f in res.findings}
+    assert {"GV001", "GV002", "GV003", "GV901"} <= rules_found and res.ignored == []
+
+
+def test_ignore_inside_a_string_literal_is_not_a_directive(tmp_path):
+    res = lint_file(_write(tmp_path / "a.sql", "select 'see -- gulliver: ignore-file' as note, * from events e, users u;\n"))
+    assert "GV003" in {f.rule for f in res.findings} and res.ignored == []
+    # a bare directive and an explicit `all` still ignore every rule, and a reason after it is fine
+    for d in ("-- gulliver: ignore", "-- gulliver: ignore all", "-- gulliver: ignore legacy report"):
+        res = lint_file(_write(tmp_path / "b.sql", d + "\nselect * from events e, users u;\n"))
+        assert res.findings == [] and len(res.ignored) == 3
+
+
+def test_fix_write_keeps_crlf_and_bom(demo_db, state, tmp_path):
+    text = "-- header\r\nselect user_id\r\nfrom events\r\nwhere DATE(ts) = '2025-01-03'\r\nlimit 10;\r\n"
+    f = tmp_path / "a.sql"
+    f.write_bytes(("\ufeff" + text).encode("utf-8"))
+    assert main(["--dsn", demo_db, "fix", "--write", "a.sql"]) == 0
+    assert f.read_bytes().decode("utf-8") == "\ufeff" + text.replace(
+        "DATE(ts) = '2025-01-03'", "ts >= '2025-01-03' AND ts < '2025-01-04'")
+
+
+def test_bom_file_is_linted(tmp_path):
+    f = tmp_path / "a.sql"
+    f.write_bytes(b"\xef\xbb\xbfselect * from a, b;\n")
+    found = _by_rule(lint_file(f))
+    assert "GV900" not in found and (found["GV001"].line, found["GV001"].col) == (1, 8)
+    assert found["GV003"].severity == "error"
+
+
+def test_fix_refuses_edits_that_would_drop_a_comment(demo_db, state, tmp_path, capsys):
+    text = "select user_id from events\nwhere DATE(ts) /* the day we care about */ = '2025-01-03'\nlimit 10;\n"
+    f = _write(tmp_path / "a.sql", text)
+    assert main(["--dsn", demo_db, "fix", "--write", "a.sql", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["unplaced"] == 1 and "comment" in data["fixes"][0]["notes"][0]
+    assert f.read_text() == text
+
+
+def test_junit_is_well_formed_with_control_characters(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path / "a.sql", "select user_id from events where event_type like '%a\x01b' limit 5;\n")
+    xml = render(lint_paths(["a.sql"], fail_on="info"), "junit")
+    ET.fromstring(xml)
+    assert "\x01" not in xml
+
+
+def test_missing_single_path_is_not_found(state, tmp_path, capsys):
+    for value in ("models", "missing_dir/", "does/not/exist.sql"):
+        assert main(["lint", value]) == 1
+        assert f"Not found: {value}" in capsys.readouterr().out
+    assert main(["lint", "select x from t limit 1"]) == 0               # one SQL string is still SQL
+
+
+def test_fix_without_a_connection_says_tables_were_not_checked(state, tmp_path, capsys):
+    _write(tmp_path / "a.sql", "select user_id from events where DATE(ts) = '2025-01-03' limit 3;\n")
+    assert main(["fix", "--check", "a.sql", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["status"] == "warn" and any("events" in n for n in data["notes"])

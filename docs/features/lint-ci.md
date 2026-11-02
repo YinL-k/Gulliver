@@ -25,8 +25,10 @@ gulliver fix --write models/ -c warehouse               # apply same-rows rewrit
 ```
 
 `gulliver lint` with one SQL string (or `-f file.sql`, or stdin) works exactly as before. A value that
-exists on disk, more than one value, or a files-only flag (`--format sarif|github|gitlab|junit`, `--fail-on`,
-`--exclude`, `--warn-unused-ignores`, `--metadata`, `-o`) switches to files mode.
+exists on disk, more than one value, a files-only flag (`--format sarif|github|gitlab|junit`, `--fail-on`,
+`--exclude`, `--warn-unused-ignores`, `--metadata`, `-o`), or one value that looks like a path (no spaces, and
+a bare word, or it ends in `/` or `.sql`, or holds a `/`) switches to files mode. So a mistyped or missing
+`models/` gives `Not found` and exit 1, not a SQL parse error.
 
 Exit codes: `0` nothing at or above `fail_on`, `2` at least one finding fails the check (or, for
 `fix --check`, a rewrite is available), `1` a path or the config is wrong.
@@ -113,9 +115,14 @@ select user_id, ts from events order by ts;
 -- gulliver: ignore-file GV004       (anywhere in the file: the whole file)
 ```
 
-Rule ids or names work (`GV001` or `select-star`). Without a rule list, every rule is ignored there. Words
-after the rule list are a free-text reason. `{# gulliver: ignore GV001 #}` works in dbt files.
-`--warn-unused-ignores` reports ignore comments that no longer ignore anything (`GV901 unused-ignore`).
+Rule ids or names work (`GV001` or `select-star`). Without a rule list (or with `all`), every rule is
+ignored there. Words after the rule list are a free-text reason. `{# gulliver: ignore GV001 #}` works in dbt
+files. A directive inside a string literal is not a comment and is not read.
+
+A rule list Gulliver cannot read ignores nothing and is always reported as `GV901`: an unknown rule id
+(`GV-001`, `GV999`), a near-miss name (`select_star`), or no space after `ignore` (`ignore: GV001`,
+`ignore(GV001)`). A typo therefore never turns into "ignore every rule".
+`--warn-unused-ignores` also reports ignore comments that no longer ignore anything (`GV901 unused-ignore`).
 
 ### Configuration
 
@@ -177,11 +184,18 @@ repos:
 `gulliver fix --check` and `--write` (and the SARIF `fixes`) use only rewrites with the `same` guarantee
 from `gulliver fix`: today that is GV005, a function on a date column turned into a range on the raw column,
 and only when the connection shows the column is a DATE or a TIMESTAMP without time zone. Without a
-connection (or with `gulliver lint` without `--metadata`) the type is unknown, so no fix is offered.
+connection (or with `gulliver lint` without `--metadata`) the type is unknown, so no fix is offered. When a
+table is not found in the connection (or there is no connection), `fix` says so in `notes` and the status is
+`warn`, so "nothing to rewrite" is not mistaken for a clean check.
 
-Each fix is applied as a small text edit, so comments and formatting stay. Before an edit is accepted,
-Gulliver applies it and re-parses the statement: it must parse to exactly the tree `gulliver fix` produced.
-If it does not, or the edit would touch dbt Jinja, the fix is listed as not placed and the file is left alone.
+A fix is offered only where its finding is reported: a `gulliver: ignore` comment or `[lint] disable` for
+GV005 also stops `fix --check` and `fix --write` there.
+
+Each fix is applied as a small text edit, so comments, formatting, line endings (`\r\n` stays `\r\n`)
+and a UTF-8 BOM stay. Before an edit is accepted, Gulliver applies it and re-parses the statement: it must
+parse to exactly the tree `gulliver fix` produced. If it does not, the edit would touch dbt Jinja (also a
+`{% if %}` or `{# #}` right next to it), or it would remove a comment inside the changed code, the fix is
+listed as not placed and the file is left alone.
 
 Viewers differ in what they do with SARIF `fixes`; GitHub Code Scanning shows the alert either way.
 
@@ -191,8 +205,11 @@ Viewers differ in what they do with SARIF `fixes`; GitHub Code Scanning shows th
 repeats each order once per item, so the total is multiplied. GV015 (warn) flags it only in this narrow
 shape, to keep false alarms rare: one equality in the `ON`, one side's column is `id` and the other's ends
 in `_id`, the many side is a plain table (not a subquery or CTE that may already be aggregated), and the
-query does not group by the many side's `id`. It does not know real keys, so a 1:1 join named this way is
-flagged too; ignore it there with `-- gulliver: ignore GV015`.
+query does not group by the many side's `id`. An anti-join (`LEFT JOIN many ... WHERE many.x IS NULL`)
+is not flagged: each one-side row survives at most once. It does not know real keys or intent, so a 1:1
+join named this way, or a fact-to-dimension lookup where repeating the value is intended
+(`sum(p.price) from order_items i join products p on p.id = i.product_id`), is flagged too; ignore it there
+with `-- gulliver: ignore GV015`.
 
 ### Limits
 

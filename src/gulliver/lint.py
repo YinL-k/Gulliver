@@ -322,6 +322,8 @@ def _fan_trap(select: exp.Select, tree: exp.Expression) -> tuple[exp.Expression,
             continue
         if one not in sources or (many, "id") in group_cols:
             continue
+        if _anti_join(select, join, many):
+            continue
         for projection in select.expressions:
             for agg in projection.find_all(exp.Sum, exp.Avg, exp.Count):
                 if agg.find_ancestor(exp.Window) or agg.find_ancestor(exp.Select) is not select:
@@ -332,6 +334,20 @@ def _fan_trap(select: exp.Select, tree: exp.Expression) -> tuple[exp.Expression,
                 if cols and all(c.table and c.table.lower() == one for c in cols):
                     return agg, one, many, cond
     return None
+
+
+def _anti_join(select: exp.Select, join: exp.Join, many: str) -> bool:
+    """LEFT JOIN many ... WHERE many.<col> IS NULL keeps only the rows with no match: each one row once."""
+    side = (join.args.get("side") or "").upper()
+    joined = (join.this.alias_or_name or "").lower()
+    if not ((side == "LEFT" and joined == many) or (side == "RIGHT" and joined != many)):
+        return False
+    where = select.args.get("where")
+    if where is None:
+        return False
+    conds = list(where.this.flatten()) if isinstance(where.this, exp.And) else [where.this]
+    return any(isinstance(c, exp.Is) and isinstance(c.expression, exp.Null) and isinstance(c.this, exp.Column)
+               and (c.this.table or "").lower() == many for c in conds)
 
 
 def summarize(findings: list[Finding]) -> dict[str, int]:
