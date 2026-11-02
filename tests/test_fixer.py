@@ -117,6 +117,10 @@ def test_type_must_come_from_one_base_table():
     ("select a from t where date_trunc('month', ts) = '9999-12-01'", "duckdb"),
     ("select a from t where year(ts) > 2023", "duckdb"),                           # DuckDB infinity: one-sided YEAR
     ("select a from t where not (year(ts) = 2024)", "duckdb"),                     # DuckDB infinity: negated YEAR
+    ("select a from t where (year(ts) = 2024) is null", "duckdb"),                 # DuckDB infinity: NULL vs FALSE
+    ("select a from t where coalesce(year(ts) = 2024, true)", "duckdb"),
+    ("select a from t where (year(ts) = 2024) = false", "duckdb"),
+    ("select a from t where case when year(ts) = 2024 then false else true end", "duckdb"),
 ])
 def test_range_rewrites_left_alone(sql, dialect):
     for mode in ("safe", "all"):
@@ -303,3 +307,20 @@ def test_mcp_fix_tool(demo_db, state, monkeypatch):
     text = json.dumps(result if isinstance(result, (dict, list)) else
                       (result.model_dump() if hasattr(result, "model_dump") else str(result)), default=str)
     assert "GV005" in text and "same" in text
+
+
+def test_year_rewrite_keeps_the_rows_on_infinity_where_it_is_still_offered():
+    con = duckdb.connect()
+    con.execute("create table t (a integer, ts timestamp)")
+    con.execute("insert into t values (1, 'infinity'), (2, '2024-05-01'), (3, '2023-05-01'), (4, null)")
+    for sql in ("select a from t where year(ts) = 2024 or a = 3", "select a from t where (year(ts) = 2024 and a > 0)"):
+        out = rewrite(sql, "duckdb", table_info=typed("TIMESTAMP"))
+        assert [c["guarantee"] for c in out["changes"] if c["rule"] == "GV005"] == ["same"], sql
+        assert sorted(con.execute(sql).fetchall()) == sorted(con.execute(out["fixed_sql"]).fetchall()), sql
+
+
+def test_not_in_projecting_an_outer_column_is_left_alone():
+    out = rewrite("select o.id from orders o where o.cid not in (select o.x from blocked)", "duckdb", mode="all")
+    assert "GV012" not in [c["rule"] for c in out["changes"]]
+    out = rewrite("select o.id from orders o where o.cid not in (select b.cid from blocked b)", "duckdb", mode="all")
+    assert "GV012" in [c["rule"] for c in out["changes"]]

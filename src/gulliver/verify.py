@@ -57,6 +57,10 @@ CANDIDATES = {
     "bool": ["BOOLEAN"],
     "default": ["INTEGER", "VARCHAR"],
 }
+INT_RANGES = {"TINYINT": (-2**7, 2**7 - 1), "SMALLINT": (-2**15, 2**15 - 1), "INT": (-2**31, 2**31 - 1),
+              "INTEGER": (-2**31, 2**31 - 1), "BIGINT": (-2**63, 2**63 - 1), "UTINYINT": (0, 2**8 - 1),
+              "USMALLINT": (0, 2**16 - 1), "UINTEGER": (0, 2**32 - 1), "UBIGINT": (0, 2**64 - 1),
+              "UHUGEINT": (0, 2**128 - 1)}
 PRIORITY = {"temporal": 5, "datestr": 4, "number": 3, "string": 2, "bool": 1, "default": 0}
 _ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
 _DEFAULT_ANCHORS = (date(2024, 1, 1), date(2024, 2, 29), date(2024, 10, 27), date(2024, 12, 31))
@@ -197,41 +201,87 @@ def _context(col: exp.Column) -> tuple[str, Any]:
     return "default", None
 
 
+def _source_items(select: exp.Select) -> list[exp.Expression]:
+    frm = select.args.get("from_") or select.args.get("from")
+    items = [frm.this] if frm is not None else []
+    items.extend(j.this for j in select.args.get("joins") or [])
+    return items
+
+
 def _select_sources(select: exp.Select, gv: set[str]) -> list[tuple[str, str | None]]:
     """(alias, gv table or None for a derived source) for the FROM and JOIN items of one SELECT."""
-    items = []
-    frm = select.args.get("from_") or select.args.get("from")
-    if frm is not None:
-        items.append(frm.this)
-    items.extend(j.this for j in select.args.get("joins") or [])
     out = []
-    for item in items:
+    for item in _source_items(select):
         name = item.name.lower() if isinstance(item, exp.Table) else ""
         out.append(((item.alias_or_name or "").lower(), name if name in gv else None))
     return out
 
 
-def _owner(col: exp.Column, gv: set[str]) -> str | None:
-    """The generated table a column reference belongs to, or None (a CTE, subquery or output alias)."""
+def _body(item: exp.Expression, gv: set[str]) -> exp.Expression | None:
+    """The query behind a derived source: a subquery, or the CTE a table name refers to."""
+    if isinstance(item, exp.Subquery):
+        return item.this
+    if isinstance(item, exp.Table) and item.name.lower() not in gv:
+        node = item.parent
+        while node is not None:
+            for cte in (node.args.get("with_") or node.args.get("with") or exp.With()).expressions:
+                if cte.alias_or_name.lower() == item.name.lower():
+                    return cte.this
+            node = node.parent
+    return None
+
+
+def _through(item: exp.Expression, name: str, gv: set[str], depth: int) -> tuple[str, str] | None:
+    """The base (gv table, column) behind column `name` of a FROM item, through CTEs and subqueries."""
+    if isinstance(item, exp.Table) and item.name.lower() in gv:
+        return item.name.lower(), name
+    body = _body(item, gv)
+    if body is None or depth > 8:
+        return None
+    selects = [body] if isinstance(body, exp.Select) else list(body.find_all(exp.Select)) \
+        if isinstance(body, exp.SetOperation) else []
+    for select in selects[:1]:  # the first SELECT of a UNION names the columns
+        star = None
+        for p in select.expressions:
+            if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star)):
+                star = p
+            elif p.alias_or_name.lower() == name:
+                inner = p.unalias()
+                return _origin(inner, gv, depth + 1) if isinstance(inner, exp.Column) else None
+        if star is not None:
+            items = _source_items(select)
+            if isinstance(star, exp.Column) and star.table:
+                items = [i for i in items if (i.alias_or_name or "").lower() == star.table.lower()]
+            if len(items) == 1:
+                return _through(items[0], name, gv, depth + 1)
+    return None
+
+
+def _origin(col: exp.Column, gv: set[str], depth: int = 0) -> tuple[str, str] | None:
+    """The generated (table, column) a column reference reads, following CTEs and derived tables; None for an
+    output alias or a computed column."""
+    name = col.name.lower()
     select = col.find_ancestor(exp.Select)
     if col.table:
         key = col.table.lower()
         while select is not None:
-            for alias, table in _select_sources(select, gv):
-                if alias == key:
-                    return table
+            for item in _source_items(select):
+                if (item.alias_or_name or "").lower() == key:
+                    return _through(item, name, gv, depth)
             select = select.find_ancestor(exp.Select)
         return None
     if select is None:
         return None
-    sources = _select_sources(select, gv)
-    if not sources or any(t is None for _, t in sources):
+    items = _source_items(select)
+    if not items:
         return None
     in_projection = any(c is col for p in select.expressions for c in p.find_all(exp.Column))
     aliases = {p.alias.lower() for p in select.expressions if isinstance(p, exp.Alias)}
-    if not in_projection and col.name.lower() in aliases:
+    if not in_projection and name in aliases:
         return None
-    return sources[0][1]
+    if len(items) > 1 and any(_body(i, gv) is not None or not isinstance(i, exp.Table) for i in items):
+        return None  # unqualified next to a derived source: which one it belongs to is unknown
+    return _through(items[0], name, gv, depth)
 
 
 class Schema:
@@ -269,10 +319,10 @@ def _learn(schema: Schema, tree: exp.Expression) -> None:
     for col in tree.find_all(exp.Column):
         if isinstance(col.this, exp.Star):
             continue
-        owner = _owner(col, gv)
-        if owner is None:
+        origin = _origin(col, gv)
+        if origin is None:
             continue
-        spec = schema.column(owner, col.name.lower())
+        spec = schema.column(*origin)
         hint, extra = _context(col)
         if hint == "link":
             links.append((col, extra))
@@ -293,11 +343,11 @@ def _learn(schema: Schema, tree: exp.Expression) -> None:
             if isinstance(a.unalias(), exp.Column) and isinstance(b.unalias(), exp.Column):
                 links.append((a.unalias(), b.unalias()))
     for a, b in links:
-        oa, ob = _owner(a, gv), _owner(b, gv)
+        oa, ob = _origin(a, gv), _origin(b, gv)
         if oa and ob:
-            schema.column(oa, a.name.lower())
-            schema.column(ob, b.name.lower())
-            schema.link((oa, a.name.lower()), (ob, b.name.lower()))
+            schema.column(*oa)
+            schema.column(*ob)
+            schema.link(oa, ob)
 
 
 def _group_types(schema: Schema) -> dict[tuple[str, str], list[str]]:
@@ -385,6 +435,18 @@ def _anchors(trees: list[exp.Expression]) -> list[date]:
     return sorted(found) or list(_DEFAULT_ANCHORS)
 
 
+def _has_infinity(dialect: str, trees: list[exp.Expression]) -> bool:
+    """Whether 'infinity' dates and timestamps belong in the pools. BigQuery and Snowflake cannot store them.
+    Postgres can, but its EXTRACT(YEAR FROM 'infinity') is Infinity where DuckDB's is NULL, so a test in DuckDB
+    semantics would find a difference that cannot happen there."""
+    if dialect == "duckdb":
+        return True
+    if dialect != "postgres":
+        return False
+    parts = _classes("Year", "Extract", "Quarter", "Month", "Week", "Day", "DayOfWeek", "DayOfYear")
+    return not any(tree.find(*parts) for tree in trees)
+
+
 def _days(anchors: list[date]) -> list[date]:
     out: set[date] = {date(2024, 2, 29)}
     for a in anchors:
@@ -404,16 +466,17 @@ def _days(anchors: list[date]) -> list[date]:
 
 
 class _Pools:
-    def __init__(self, anchors: list[date]):
+    def __init__(self, anchors: list[date], infinite: bool = True):
         self.anchors = anchors
         self.days = _days(anchors)
         self.zoned: dict[str, list[str]] = {}
+        self.infinity = ["infinity", "-infinity"] if infinite else []
 
     def stamps(self) -> list[str]:
         out = []
         for d in self.days:
             out += [f"{d} 00:00:00", f"{d} 00:00:00.000001", f"{d} 12:00:00", f"{d} 23:59:59.999999"]
-        return out + ["infinity", "-infinity"]
+        return out + self.infinity
 
     def zoned_stamps(self, con: duckdb.DuckDBPyConnection, zone: str) -> list[str]:
         """Instants around local midnights and the zone's daylight-saving jumps, as text with offsets."""
@@ -428,7 +491,7 @@ class _Pools:
                    f"v(d) {'UNION ALL ' + jumps if jumps else ''}) x, (VALUES (INTERVAL '-1 hour'), "
                    "(INTERVAL '-30 minutes'), (INTERVAL '-1 microsecond'), (INTERVAL '0 seconds'), "
                    "(INTERVAL '1 microsecond'), (INTERVAL '30 minutes')) y(s)")
-            self.zoned[zone] = sorted(r[0] for r in con.execute(sql).fetchall()) + ["infinity", "-infinity"]
+            self.zoned[zone] = sorted(r[0] for r in con.execute(sql).fetchall()) + self.infinity
         return self.zoned[zone]
 
     def pool(self, col: Column, ctype: str, key: bool, con: duckdb.DuckDBPyConnection,
@@ -437,13 +500,13 @@ class _Pools:
         temporal_text = col.hint in ("temporal", "datestr")
         lits = list(col.literals)
         if family in ("int", "uint"):
-            base = ["1", "2", "3"] if key else ["0", "1", "-1", "2", "7", "100", "2147483647", "-2147483648"]
+            low, high = INT_RANGES.get(ctype.upper(), (-2**127, 2**127 - 1))  # a value must fit the type
+            edges = [str(min(high, 2**31 - 1)), str(max(low, -2**31))]   # the INTEGER limits, or narrower ones
+            base = ["1", "2", "3"] if key else ["0", "1", "-1", "2", "7", "100", *edges]
             for lit in lits:
                 if re.fullmatch(r"-?\d+", lit):
                     base += [str(int(lit) + step) for step in (-1, 0, 1)]
-            if family == "uint":
-                base = [v for v in base if not v.startswith("-")]
-            return [None, *base]
+            return [None, *(v for v in base if low <= int(v) <= high)]
         if family == "float":
             base = ["1", "2", "3"] if key else ["0", "-0.0", "0.5", "1", "-1.25", "2", "nan", "inf", "-inf"]
             return [None, *base, *(x for x in lits if re.fullmatch(r"-?[\d.]+(e-?\d+)?", x))]
@@ -460,7 +523,7 @@ class _Pools:
         if family == "bool":
             return [None, "true", "false"]
         if family == "date":
-            return [None, *(str(d) for d in self.days), "infinity", "-infinity"]
+            return [None, *(str(d) for d in self.days), *self.infinity]
         if family == "timestamp":
             return [None, *self.stamps()]
         if family == "timestamptz":
@@ -494,10 +557,10 @@ class Case:
 
 
 class Runner:
-    def __init__(self, schema: Schema, deadline: float):
+    def __init__(self, schema: Schema, deadline: float, slack: float = 5.0):
         self.schema = schema
         self.deadline = deadline              # no new cases or shrink steps after this
-        self.hard_deadline = deadline + 5.0   # room to finish the counterexample in hand
+        self.hard_deadline = deadline + slack  # room to finish the counterexample in hand
         self._cons: dict[str, duckdb.DuckDBPyConnection] = {}
 
     def con(self, zone: str) -> duckdb.DuckDBPyConnection:
@@ -514,8 +577,8 @@ class Runner:
         for con in self._cons.values():
             con.close()
 
-    def _query(self, con: duckdb.DuckDBPyConnection, sql: str) -> list[tuple]:
-        left = self.hard_deadline - time.monotonic()
+    def _query(self, con: duckdb.DuckDBPyConnection, sql: str, until: float) -> list[tuple]:
+        left = until - time.monotonic()
         if left <= 0:
             raise _BadCase("time budget used up")
         timer = threading.Timer(min(QUERY_TIMEOUT_S, left), con.interrupt)
@@ -527,33 +590,50 @@ class Runner:
         finally:
             timer.cancel()
 
-    def run(self, case: Case, sqls: list[str]) -> list[tuple[str, Any]]:
-        """("rows", (column count, Counter of rows as text)) or ("error", message) per query."""
+    def _setup(self, con: duckdb.DuckDBPyConnection, case: Case) -> None:
+        """Open a transaction and create the case's tables in it (all of it goes away on ROLLBACK)."""
+        con.execute("BEGIN")
+        for t in sorted(self.schema.tables):
+            table = self.schema.tables[t]
+            cols = ", ".join(f"{_ident(c)} {case.types[(t, c)]}" for c in table.columns)
+            rows = case.rows.get(t) or []
+            values = ", ".join("(" + ", ".join(_literal(v) for v in row) + ")" for row in rows)
+            try:
+                con.execute(f"CREATE TABLE {t} ({cols})")
+                if rows:
+                    con.execute(f"INSERT INTO {t} VALUES {values}")
+            except duckdb.Error as exc:
+                con.execute("ROLLBACK")
+                raise _BadCase(str(exc).splitlines()[0]) from exc
+
+    def run(self, case: Case, sqls: list[str], until: float | None = None) -> list[tuple[str, Any]]:
+        """("rows", (column count, Counter of rows as text)) or ("error", message) per query.
+
+        The queries share one transaction, so now() and current_date are the same for each of them. An error
+        aborts a DuckDB transaction, so after one the tables are built again in a fresh transaction: a failing
+        query must not make the queries after it fail too."""
         con = self.con(case.zone)
-        con.execute("BEGIN")  # one transaction: now() and current_date are the same for every query
+        until = self.hard_deadline if until is None else until
+        self._setup(con, case)
+        active = True
         try:
-            for t in sorted(self.schema.tables):
-                table = self.schema.tables[t]
-                cols = ", ".join(f"{_ident(c)} {case.types[(t, c)]}" for c in table.columns)
-                rows = case.rows.get(t) or []
-                values = ", ".join("(" + ", ".join(_literal(v) for v in row) + ")" for row in rows)
-                try:
-                    con.execute(f"CREATE TABLE {t} ({cols})")
-                    if rows:
-                        con.execute(f"INSERT INTO {t} VALUES {values}")
-                except duckdb.Error as exc:
-                    raise _BadCase(str(exc).splitlines()[0]) from exc
             out: list[tuple[str, Any]] = []
-            for sql in sqls:
+            for i, sql in enumerate(sqls):
                 try:
-                    rows = self._query(con, f"SELECT COLUMNS(*)::VARCHAR FROM ({sql}) AS gv_result")
+                    rows = self._query(con, f"SELECT COLUMNS(*)::VARCHAR FROM ({sql}) AS gv_result", until)
                     width = len(con.description or [])
                     out.append(("rows", (width, Counter(rows))))
                 except duckdb.Error as exc:
                     out.append(("error", str(exc).splitlines()[0]))
+                    con.execute("ROLLBACK")
+                    active = False
+                    if i + 1 < len(sqls):
+                        self._setup(con, case)
+                        active = True
             return out
         finally:
-            con.execute("ROLLBACK")
+            if active:
+                con.execute("ROLLBACK")
 
     def binds(self, case: Case, sql: str) -> str | None:
         """None when `sql` binds on these (empty) tables, else the engine's message."""
@@ -723,6 +803,32 @@ def _show(result: tuple[str, Any], limit: int = 20) -> Any:
     return [list(r) for r in sorted(result[1][1].elements(), key=lambda r: [(v is None, v or "") for v in r])][:limit]
 
 
+def _qualified(ref: str) -> tuple[list[str], str]:
+    """The statements that make the schema (and catalog) of a table name exist in a fresh DuckDB, and the quoted
+    name itself."""
+    parts = ref.split(".")[-3:]
+    quoted = [_ident(p) for p in parts]
+    before = []
+    if len(parts) == 3:
+        before.append(f"ATTACH IF NOT EXISTS ':memory:' AS {quoted[0]};")
+    if len(parts) >= 2:
+        before.append(f"CREATE SCHEMA IF NOT EXISTS {'.'.join(quoted[:-1])};")
+    return before, ".".join(quoted)
+
+
+def _with_refs(schema: Schema, sql: str) -> str:
+    """A query on the gv_tN tables, back on the names the query used (for the paste-and-run repro)."""
+    tree = sqlglot.parse_one(sql, read="duckdb")
+    for node in tree.find_all(exp.Table):
+        table = schema.tables.get(node.name)
+        if table is not None and not node.args.get("db"):
+            parts = [exp.to_identifier(p, quoted=True) for p in table.ref.split(".")[-3:]]
+            node.set("this", parts[-1])
+            node.set("db", parts[-2] if len(parts) > 1 else None)
+            node.set("catalog", parts[-3] if len(parts) > 2 else None)
+    return tree.sql(dialect="duckdb")
+
+
 def _counterexample(runner: Runner, schema: Schema, case: Case, original: str, variant: str) -> dict[str, Any]:
     a, b = runner.run(case, [original, variant])
     tables, setup = {}, []
@@ -731,16 +837,22 @@ def _counterexample(runner: Runner, schema: Schema, case: Case, original: str, v
         cols = list(table.columns)
         tables[table.ref] = {"columns": {c: case.types[(t, c)] for c in cols},
                              "rows": [dict(zip(cols, r, strict=True)) for r in case.rows.get(t) or []]}
-        setup.append(f"CREATE TABLE {table.ref} (" + ", ".join(f"{_ident(c)} {case.types[(t, c)]}" for c in cols)
+        before, name = _qualified(table.ref)
+        setup += [x for x in before if x not in setup]
+        setup.append(f"CREATE TABLE {name} (" + ", ".join(f"{_ident(c)} {case.types[(t, c)]}" for c in cols)
                      + ");")
         if case.rows.get(t):
-            setup.append(f"INSERT INTO {table.ref} VALUES " + ", ".join(
+            setup.append(f"INSERT INTO {name} VALUES " + ", ".join(
                 "(" + ", ".join(_literal(v, case.types[(t, c)]) for c, v in zip(cols, r, strict=True)) + ")"
                 for r in case.rows[t]) + ";")
     if any(_family(v) == "timestamptz" for v in case.types.values()):
         setup.insert(0, f"SET TimeZone = {_literal(case.zone)};")
     out: dict[str, Any] = {"tables": tables, "original_result": _show(a), "fixed_result": _show(b),
                            "setup_sql": "\n".join(setup)}
+    try:  # the two queries as they ran, in DuckDB SQL on the setup's tables
+        out["original_sql"], out["fixed_sql"] = _with_refs(schema, original), _with_refs(schema, variant)
+    except sqlglot.errors.SqlglotError:
+        pass
     if a[0] == b[0] == "rows":
         out["only_in_original"] = _show(("rows", (0, a[1][1] - b[1][1])))
         out["only_in_fixed"] = _show(("rows", (0, b[1][1] - a[1][1])))
@@ -771,18 +883,19 @@ def check(original: str, candidates: list[str], dialect: str = "duckdb", table_i
         return {**base, "status": "skipped", "reason": f"could not parse: {str(exc).splitlines()[0]}", "results": []}
     trees = [sqlglot.parse_one(s, read="duckdb") for s in [original_sql, *variant_sqls]]
     schema, source = _build_schema(names, trees, table_info, dialect)
-    runner = Runner(schema, started + time_budget_s)
+    # slack for the counterexample in hand, small when the whole budget is small (preflight: 2 s)
+    runner = Runner(schema, started + time_budget_s, slack=min(5.0, max(0.5, time_budget_s / 4)))
     try:
         try:
             valid = _fit_types(runner, schema, _group_types(schema), original_sql)
         except (Unsupported, _BadCase) as exc:
             return {**base, "status": "skipped", "reason": str(exc), "results": []}
-        pools = _Pools(_anchors(trees))
+        pools = _Pools(_anchors(trees), _has_infinity(dialect, trees))
         zone = timezone or ("UTC" if dialect == "bigquery" else None)  # BigQuery has no session time zone
         rng = random.Random(seed)  # noqa: S311 - test data, not secrets
-        stats = [{"cases": 0, "counterexamples": 0, "by_type": {}} for _ in candidates]
+        stats = [{"cases": 0, "counterexamples": 0, "both_failed": 0, "by_type": {}} for _ in candidates]
         first: list[Case | None] = [None] * len(candidates)
-        ran = invalid = both_failed = 0
+        ran = invalid = original_failed = 0
         stopped = False
         for index in range(cases):
             if time.monotonic() >= runner.deadline:
@@ -790,14 +903,17 @@ def check(original: str, candidates: list[str], dialect: str = "duckdb", table_i
                 break
             case = _draw(rng, schema, valid, pools, runner, index, zone)
             try:
-                results = runner.run(case, [original_sql, *variant_sqls])
+                results = runner.run(case, [original_sql, *variant_sqls], until=runner.deadline)
             except _BadCase:
                 invalid += 1
                 continue
             ran += 1
-            both_failed += results[0][0] == "error"
+            original_failed += results[0][0] == "error"
             sig = tuple(sorted(case.signature.items()))
             for i, result in enumerate(results[1:]):
+                if results[0][0] == result[0] == "error":
+                    stats[i]["both_failed"] += 1  # agrees, but tested nothing: not counted as a case
+                    continue
                 bucket = stats[i]["by_type"].setdefault(sig, {"types": dict(sig), "cases": 0, "counterexamples": 0})
                 stats[i]["cases"] += 1
                 bucket["cases"] += 1
@@ -809,6 +925,8 @@ def check(original: str, candidates: list[str], dialect: str = "duckdb", table_i
         out_results = []
         for i, stat in enumerate(stats):
             item: dict[str, Any] = {"cases": stat["cases"], "counterexamples": stat["counterexamples"]}
+            if stat["both_failed"]:
+                item["both_failed"] = stat["both_failed"]
             if any(stat["by_type"]):  # some types or the time zone varied between cases
                 item["by_type"] = sorted(stat["by_type"].values(), key=lambda b: sorted(b["types"].items()))
             if first[i] is not None:
@@ -822,15 +940,20 @@ def check(original: str, candidates: list[str], dialect: str = "duckdb", table_i
         notes.append("Compared the full results without the outer LIMIT/OFFSET (it only cuts the same rows).")
     if dialect != "duckdb":
         notes.append(f"Translated from {dialect} to DuckDB for the test; the target engine may differ in details.")
-    if both_failed:
-        notes.append(f"In {both_failed} case(s) the original query failed on the generated data (both failing "
-                     "counts as agreeing).")
+    if original_failed:
+        notes.append(f"In {original_failed} case(s) the original query failed on the generated data. Where the "
+                     "rewrite failed too, the case is not counted (it tested nothing).")
+    if invalid:
+        notes.append(f"{invalid} generated case(s) could not be built or took too long, and are not counted.")
     if stopped:
         notes.append(f"Stopped after {ran} cases: the time budget of {time_budget_s:g} s was used up.")
     status = "warn" if any(r["counterexamples"] for r in out_results) else "ok"
-    if ran == 0 or ran == both_failed:
+    if ran == original_failed and status == "ok":
         status = "skipped"
         base["reason"] = "no generated case ran the original query successfully"
+    if original_failed:
+        base["original_failed"] = original_failed
+        base["weak"] = original_failed * 2 > ran  # most cases tested nothing
     schema_out = {}
     for t in sorted(schema.tables):
         table = schema.tables[t]
@@ -838,7 +961,7 @@ def check(original: str, candidates: list[str], dialect: str = "duckdb", table_i
         for c, col in table.columns.items():
             root = schema.find((t, c))
             schema_out[table.ref][c] = col.types[0] if col.known else " | ".join(valid.get(root) or col.types)
-    return {**base, "status": status, "cases": ran, "invalid_cases": invalid, "stopped_early": stopped,
+    return {**base, "status": status, "cases": ran - original_failed, "invalid_cases": invalid, "stopped_early": stopped,
             "elapsed_s": round(time.monotonic() - started, 3), "schema": schema_out, "schema_source": source,
             "notes": notes, "results": out_results}
 
@@ -884,6 +1007,9 @@ def verify_rewrite(sql: str, dialect: str = "duckdb", mode: str = "safe", limit:
         item["meaning"] = (f"no difference found in {item['cases']} generated cases ({SEMANTICS}); a test, not a proof"
                            if not item["counterexamples"] else
                            f"rows differ in {item['counterexamples']} of {item['cases']} generated cases")
+        if item.get("both_failed"):
+            item["meaning"] += (f" (not counted: {item['both_failed']} more cases where the original and the "
+                                "rewrite both failed)")
         changes[i]["verified_on_generated_data"] = item
         if example is not None:
             changes[i]["counterexample"] = example
@@ -918,8 +1044,11 @@ def finish(result: dict[str, Any]) -> None:
         result["next_step"] = (result.get("next_step", "") + f" Generated data shows rows that differ for {rules} "
                                "(see changes[].counterexample): only use it if that data cannot occur.").strip()
     elif report.get("status") == "ok":
+        failed = report.get("original_failed")
+        weak = (f" The original query failed on {failed} other generated cases, which are not counted"
+                + (": a weak test." if report.get("weak") else ".")) if failed else ""
         result["next_step"] = (result.get("next_step", "") + f" Tested on {report['cases']} generated cases "
-                               f"({SEMANTICS}): no difference found. That is a test, not a proof.").strip()
+                               f"({SEMANTICS}): no difference found. That is a test, not a proof.{weak}").strip()
     elif report.get("status") in ("skipped", "error") and result.get("changes"):
         why = report.get("reason") or report.get("error") or ""
         result["next_step"] = (result.get("next_step", "") + f" Not tested on generated data: {why}.").strip()

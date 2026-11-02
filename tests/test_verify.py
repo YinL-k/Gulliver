@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import duckdb
 import pytest
@@ -245,3 +246,87 @@ def test_mcp_fix_verify(demo_db, state, monkeypatch):
     text = json.dumps(result if isinstance(result, (dict, list)) else
                       (result.model_dump() if hasattr(result, "model_dump") else str(result)), default=str)
     assert "verified_on_generated_data" in text and "DuckDB semantics" in text
+
+
+# -- regressions ------------------------------------------------------------------------------
+def test_a_failing_query_does_not_abort_the_queries_after_it():
+    # an earlier query that overflows must not turn a correct `same` rewrite after it into an error
+    sql = ("select id + 1 as n from t where not (date(a) between '2024-01-01' and '2024-01-31') "
+           "union all select 0 from u where date(b) = '2024-01-15'")
+    for seed in (0, 1, 2):
+        out = verify.verify_rewrite(sql, "duckdb", "all", table_info={"u": {"columns": [
+            {"name": "b", "type": "TIMESTAMP"}]}}, seed=seed)
+        assert "dropped" not in out, seed
+        assert by_rule(out, "GV005")["guarantee"] in ("same", "assumes")
+    # when only the original fails, that is a difference
+    out = verify.check("select a + 1 as n from t", ["select a::bigint + 1 as n from t"])
+    assert out["status"] == "warn" and out["results"][0]["counterexamples"] > 0
+    assert out["results"][0]["counterexample"]["fixed_result"] != out["results"][0]["counterexample"][
+        "original_result"]
+
+
+def test_cases_where_both_queries_fail_are_not_counted():
+    sql = ("select id, cast(code as integer) as c from t where date(ts) between '2024-01-01' and '2024-01-31' "
+           "and code like '%'")
+    out = verify.verify_rewrite(sql, "duckdb", "all")
+    v = by_rule(out, "GV005")["verified_on_generated_data"]
+    assert v["both_failed"] > 0 and v["cases"] + v["both_failed"] == 200
+    assert f"{v['cases']} generated cases" in v["meaning"] and "both failed" in v["meaning"]
+    assert out["verify"]["cases"] < 200 and out["verify"]["original_failed"] > 0
+
+
+@pytest.mark.parametrize("dialect, ctype, idtype", [("bigquery", "TIMESTAMP", "INT64"),
+                                                    ("snowflake", "TIMESTAMP_NTZ", "INTEGER"),
+                                                    ("postgres", "timestamp without time zone", "integer")])
+def test_infinity_is_only_generated_where_the_engine_agrees_on_it(dialect, ctype, idtype):
+    sql = "select id from t where extract(year from ts) >= 2024"
+    info = {"t": {"columns": [{"name": "id", "type": idtype}, {"name": "ts", "type": ctype}]}}
+    assert fixer.rewrite(sql, dialect, "safe", table_info=info)["changes"][0]["guarantee"] == "same"
+    out = verify.verify_rewrite(sql, dialect, "safe", table_info=info, cases=100)
+    assert "dropped" not in out and by_rule(out, "GV005")["verified_on_generated_data"]["counterexamples"] == 0
+    assert [c["rule"] for c in verify.quick_rewrite(sql, dialect, info)["changes"]] == ["GV005"]
+
+
+def test_columns_are_followed_through_ctes_and_subqueries():
+    for sql in ("with x as (select ts from events) select count(*) from x where date(ts) between "
+                "'2024-01-01' and '2024-01-31'",
+                "select count(*) from (select * from events) s where date(s.ts) between '2024-01-01' and '2024-01-31'",
+                "with x as (select ts as t2 from events) select count(*) from x where date(t2) between "
+                "'2024-01-01' and '2024-01-31'"):
+        out = verify.verify_rewrite(sql, "duckdb", "all")
+        assert out["verify"]["schema"]["events"]["ts"].startswith("TIMESTAMP | DATE"), sql
+        v = by_rule(out, "GV005")["verified_on_generated_data"]
+        assert {b["types"]["events.ts"] for b in v["by_type"] if b["counterexamples"]} == {"VARCHAR"}, sql
+    out = verify.verify_rewrite("with x as (select ts from events) select count(*) from x where year(ts) = 2024",
+                                "duckdb", "all")
+    assert by_rule(out, "GV005")["verified_on_generated_data"]["cases"] > 0
+
+
+@pytest.mark.parametrize("ctype", ["TINYINT", "SMALLINT", "UTINYINT", "USMALLINT"])
+def test_narrow_integer_columns_do_not_lose_cases(ctype):
+    out = verify.verify_rewrite("select id from t where year(ts) = 2024", "duckdb",
+                                table_info=meta(id="INTEGER", flag=ctype, ts="TIMESTAMP"), cases=100)
+    assert out["verify"]["invalid_cases"] == 0 and out["verify"]["cases"] == 100
+
+
+def test_repro_runs_for_schema_qualified_tables():
+    for sql, dialect in (("select o.id from analytics.orders o where o.cid not in (select cid from analytics.blocked)",
+                          "duckdb"),
+                         ("select o.id from `proj.ds.orders` o where o.cid not in (select cid from `proj.ds.blocked`)",
+                          "bigquery")):
+        example = by_rule(verify.verify_rewrite(sql, dialect, "all", cases=100), "GV012")["counterexample"]
+        con = duckdb.connect()
+        con.execute(example["setup_sql"])
+        assert [list(map(str, r)) for r in con.execute(example["original_sql"]).fetchall()] == \
+            example["original_result"]
+        assert [list(map(str, r)) for r in con.execute(example["fixed_sql"]).fetchall()] == example["fixed_result"]
+
+
+def test_a_short_time_budget_is_kept_even_when_cases_are_slow():
+    joins = ", ".join(f"t {a}" for a in "abcdefg")
+    chain = " and ".join(f"{x}.id <> {y}.id" for x, y in zip("abcdef", "bcdefg", strict=True))
+    sql = f"select count(*) as n from {joins} where {chain}"
+    started = time.monotonic()
+    verify.check(sql.replace("where ", "where a.id is not null and "), [sql], "duckdb",
+                 {"t": {"columns": [{"name": "id", "type": "BIGINT"}]}}, cases=40, time_budget_s=2.0)
+    assert time.monotonic() - started < 3.5

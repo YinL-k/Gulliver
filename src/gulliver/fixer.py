@@ -244,13 +244,15 @@ def _range(col: exp.Column, low: date | None, high: date | None) -> exp.Expressi
     return exp.Paren(this=exp.And(this=parts[0], expression=parts[1]))
 
 
-def _negated(cmp: exp.Expression, stop: exp.Expression) -> bool:
+def _filter_only(cmp: exp.Expression, stop: exp.Expression) -> bool:
+    """True when only AND, OR and brackets sit between `cmp` and its WHERE. There NULL and FALSE keep the same
+    rows; NOT, IS NULL, COALESCE, = FALSE, CASE ... can tell them apart."""
     node = cmp.parent
     while node is not None and node is not stop:
-        if isinstance(node, exp.Not):
-            return True
+        if not isinstance(node, (exp.And, exp.Or, exp.Paren)):
+            return False
         node = node.parent
-    return False
+    return node is stop
 
 
 def _rewrite_range(cmp: exp.Expression, where: exp.Where, dialect: str,
@@ -296,8 +298,8 @@ def _rewrite_range(cmp: exp.Expression, where: exp.Where, dialect: str,
         }[op]
     if bounds == (None, None) or (two_sided and None in bounds):
         return None  # the next period would start after year 9999
-    if dialect == "duckdb" and kind == "number" and (not two_sided or _negated(cmp, where)):
-        return None  # DuckDB: YEAR('infinity') is NULL, a range on 'infinity' is not
+    if dialect == "duckdb" and kind == "number" and (not two_sided or not _filter_only(cmp, where)):
+        return None  # DuckDB: YEAR('infinity') is NULL, a range on 'infinity' is not (TRUE one-sided, else FALSE)
     return _range(col, *bounds), col, unit
 
 
@@ -356,6 +358,8 @@ def _fix_not_in(tree: exp.Expression, dialect: str, changes: _Log) -> None:
             projected = projected.this
         if not (isinstance(source, exp.Table) and isinstance(projected, exp.Column)):
             continue
+        if projected.table and projected.table.lower() not in {source.name.lower(), source.alias_or_name.lower()}:
+            continue  # the subquery returns an outer column (o.x): rebuilding it on the subquery table changes it
         alias = source.alias_or_name if source.alias else "gv_sub"
         if alias.lower() == outer_col.table.lower():
             continue  # same name inside and outside: the rewrite could bind to the wrong table

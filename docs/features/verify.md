@@ -31,16 +31,18 @@ GV012 [same rows unless a NULL is involved (in the subquery, or in the outer col
   before: NOT o.customer_id IN (SELECT customer_id FROM blocked)
   after:  NOT EXISTS(SELECT 1 FROM blocked AS gv_sub WHERE gv_sub.customer_id = o.customer_id)
   tested: rows differ in 112 of 200 generated cases
-  repro:  CREATE TABLE orders ("id" INTEGER, "customer_id" INTEGER);
-          INSERT INTO orders VALUES (0, NULL);
-          CREATE TABLE blocked ("customer_id" INTEGER);
-          INSERT INTO blocked VALUES (1);
+  repro:  CREATE TABLE "orders" ("id" INTEGER, "customer_id" INTEGER);
+          INSERT INTO "orders" VALUES (0, NULL);
+          CREATE TABLE "blocked" ("customer_id" INTEGER);
+          INSERT INTO "blocked" VALUES (1);
   original returns: []
   fixed returns:    [['0']]
 ```
 
 The counterexample is shrunk to the fewest rows that still show the difference (here: one order with no
-customer). `repro` is DuckDB SQL you can paste and run.
+customer). `repro` is DuckDB SQL you can paste and run: for a schema-qualified name such as `analytics.orders`
+or `proj.ds.orders` it creates the schema (and attaches an in-memory catalog) first. The JSON also has
+`original_sql` and `fixed_sql`, the two queries as they ran, in DuckDB SQL on those tables.
 
 When a column type is unknown, every type that fits the query is tried, and the result is split per type:
 
@@ -59,14 +61,19 @@ the case with each of 20 seeds we tried, 200 cases each).
 
 JSON: each change gets `verified_on_generated_data` (`cases`, `counterexamples`, `meaning`, and `by_type` when
 types or time zones varied) and, when rows differ, `counterexample` (`tables` with column types and rows,
-`original_result`, `fixed_result`, `only_in_original`, `only_in_fixed`, `setup_sql`, `types`). The top-level
-`verify` block has `status`, `cases`, `seed`, `schema` (the types used), `schema_source` (`metadata`, `inferred`
+`original_result`, `fixed_result`, `only_in_original`, `only_in_fixed`, `setup_sql`, `original_sql`,
+`fixed_sql`, `types`). The top-level `verify` block has `status`, `cases` (the cases the original query ran on
+without an error), `original_failed` and `weak` (when the original failed on more than half the cases),
+`invalid_cases` (cases that could not be built or took too long), `seed`, `schema` (the types used), `schema_source` (`metadata`, `inferred`
 or both), `semantics: "DuckDB semantics"` and `notes`.
 
 ### What the generated data contains
 
 Each case is 0, 1, 2, 3, 5, 8, 13 or 50 rows per table. Values are seeded draws from edge-case pools: NULL,
-duplicate values and duplicate rows, 0, -1, the integer limits, NaN, ±infinity, empty and padded strings, leap
+duplicate values and duplicate rows, 0, -1, the integer limits (of the column's type when it is narrower than
+INTEGER), NaN, ±infinity (dates and timestamps only for DuckDB, and for Postgres when the query does not extract
+a date part: BigQuery and Snowflake cannot store infinity, and Postgres's `EXTRACT(YEAR FROM 'infinity')` is
+Infinity where DuckDB's is NULL), empty and padded strings, leap
 days, month and year boundaries, `00:00:00.000001` and `23:59:59.999999` next to every date the query
 mentions, and the instants around daylight-saving jumps in UTC, Europe/Amsterdam, Atlantic/Azores,
 America/Santiago and Asia/Kolkata. Join keys, `IN` subquery columns and `UNION` columns come from one small shared
@@ -74,7 +81,9 @@ set of values, so joins, anti-joins and duplicates really happen.
 
 Types come from the connection's metadata (`gulliver_inspect`) when Gulliver has it. Otherwise they are inferred
 from how the query uses each column (a date function, a comparison with a number or with `'2024-01-01'`, LIKE,
-SUM ...). A column the inference missed is added when the engine reports it missing.
+SUM ...). A column read through a CTE or a derived table (`with x as (select ts from events) ... date(ts)`, also
+through `select *` and aliases) is followed back to its base table. A column the inference missed is added when
+the engine reports it missing.
 
 ### Guarantees
 
@@ -84,12 +93,16 @@ SUM ...). A column the inference missed is added when the engine reports it miss
   to `dropped` (with its counterexample), `fixed_sql` is rebuilt without it, the status becomes `warn` and
   `next_step` says to report it.
 - **Deterministic.** The same SQL, types, seed and case count give the same cases and the same result. A run
-  stops at a time budget (30 s; 2 s inside preflight) and then says how many cases ran (`stopped_early`).
+  stops at a time budget (30 s; 2 s inside preflight) and then says how many cases ran (`stopped_early`). A
+  query running at the end of the budget is stopped; only a counterexample in hand gets a little more time (a
+  quarter of the budget, at most 5 s).
 - **Isolated and free.** The tables live in a private in-memory DuckDB with file and network access disabled and
   the configuration locked. Your data is never read and no query runs on your connection. No budget is spent.
 - **Multiset comparison.** Row order does not count, duplicates do. Values are compared as text, so a NULL equals
-  a NULL and NaN equals NaN. When the original and the rewrite both fail on a case, that case counts as agreeing.
-  When only one of them fails, that is a difference.
+  a NULL and NaN equals NaN. When only one of the original and the rewrite fails, that is a difference. When both
+  fail, the case agrees but tested nothing, so it is not counted in `cases` and the result says how many there
+  were (`both_failed`, and in `meaning`). Each query runs on fresh tables after one fails, so a failing query
+  never makes the next one fail.
 
 ### Limits
 
