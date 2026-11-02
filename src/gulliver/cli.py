@@ -188,7 +188,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rehearse", help="Run on 1%%, 3%%, 10%% samples and predict the full run")
     _add_sql_args(p)
     p.add_argument("--fractions", help="Comma-separated, e.g. 0.01,0.03,0.1")
-    p.add_argument("--sample", choices=["largest", "all"], default="largest")
+    p.add_argument("--sample", choices=["largest", "all"], default="largest",
+                   help="largest: sample the first occurrence of the largest table, read everything else in full "
+                        "(default, unbiased for joins); all: sample every table and occurrence, each with its own "
+                        "seed (cheaper, rougher for joins)")
     p.add_argument("--method", choices=["auto", "system", "bernoulli"], default="auto")
     p.add_argument("--seed", type=int, default=42)
 

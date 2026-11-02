@@ -67,9 +67,14 @@ def test_rehearse_and_run_compare(settings):
 
 
 def test_exploding_join_is_flagged(settings):
-    reh = core.rehearse(settings, "select a.event_id, b.event_id from events a join events b on a.user_id = b.user_id")
-    assert reh["prediction"]["output_rows"]["exponent"] > 1.3
-    assert any("faster than the data" in w for w in reh["warnings"])
+    sql = "select a.event_id, b.event_id from events a join events b on a.user_id = b.user_id"
+    reh = core.rehearse(settings, sql)
+    # only one side is sampled, so the output grows linearly; the row multiplication is flagged directly
+    assert 0.9 < reh["prediction"]["output_rows"]["exponent"] < 1.1
+    assert any("multiplies rows" in w for w in reh["warnings"])
+    both = core.rehearse(settings, sql, sample="all")
+    assert both["prediction"]["output_rows"]["exponent"] > 1.3
+    assert any("faster than the data" in w for w in both["warnings"])
 
 
 def test_small_data_skips_rehearsal(settings):

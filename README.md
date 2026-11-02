@@ -90,19 +90,21 @@ gulliver lint "select * from events e, users u"           # GV003: join without 
 gulliver rehearse "select a.event_id, b.event_id from events a join events b on a.user_id = b.user_id"
 ```
 
-The last one is the classic agent mistake: a self-join on a non-unique key. The rehearsal sees the output grow
-with exponent ~1.8 instead of ~1 and warns that the full result has more than 100 million rows, before you run it.
+The last one is the classic agent mistake: a self-join on a non-unique key. The rehearsal predicts the full
+result (about 255 million rows from a 5-million-row table) and warns that the query multiplies rows, before you run it.
 
 ```
 | Sample | Runtime  | Output rows |
 |--------|----------|-------------|
-| 1%     | 0.0202s  | 41,706      |
-| 3%     | 0.0484s  | 237,422     |
-| 10%    | 0.3909s  | 2,438,395   |
+| 1%     | 0.4955s  | 2,538,840   |
+| 3%     | 1.2153s  | 7,625,948   |
+| 10%    | 4.0825s  | 25,531,916  |
 
-Prediction for 100%: output rows 134,525,654 (range 67,262,827 - 269,051,308)
-Growth exponent output_rows: 1.77 -> grows faster than the data
+Prediction for 100%: output rows 256,655,285 (range 179,658,700 - 384,982,928), confidence high
+Warning: the query multiplies rows: about 256,655,285 output rows from at most 5,000,000 input rows per table (51x)
 ```
+
+The real full run returns 254,966,150 rows.
 
 Add `--json` to any command for machine-readable output. Exit codes: `0` ok, `1` error, `2` blocked,
 `3` needs rehearsal or approval, `4` a data check failed, so it also works as a CI check.
@@ -272,10 +274,22 @@ Runtime first subtracts the fixed per-query overhead (measured with `SELECT 1`).
 or `low`, with a range of x0.7-1.5, x0.5-2 or x0.25-4. After a real run, the receipt shows predicted vs actual.
 
 By default only the **largest** table is sampled and the others stay complete, which keeps key joins honest.
-`--sample all` samples every table. For BigQuery the money prediction uses the exact dry-run bytes of the full query.
+When the query reads that table more than once (a self-join, an `IN (SELECT ...)` on the same table, a CTE used
+twice), only the first occurrence is sampled and the others are read in full on every rung. Two samples of one
+table drawn with the same seed would hold the same rows, so every row would meet itself and small rungs would come
+out too big. With one side sampled the output grows linearly and the prediction stays unbiased; the price is a full
+read of the other side per rung. A result much larger than the biggest input table is flagged as a join that
+multiplies rows. On the 5M-row demo self-join, five seeds predicted 252M-257M rows against 254,966,150 real ones.
+
+`--sample all` samples every table and every occurrence, each with its own seed. That is cheaper, but a join
+between two sampled sides grows with fraction² and the noise of both samples multiplies, so those predictions get
+`low` confidence. When a table is read more than once, `--method auto` uses row (bernoulli) sampling. When the
+smallest rung reads fewer than 2,000 rows, the range is widened one level. For BigQuery the money prediction uses
+the exact dry-run bytes of the full query.
 
 **Limits, honestly:** block (system) sampling is cheap but can be skewed on clustered data; use `--method bernoulli`
-when that matters. Extrapolating 10x always has uncertainty; Gulliver shows it instead of hiding it. Databricks,
+when that matters. On DuckDB a system sample takes whole 2,048-row vectors and is not repeatable even with a seed,
+so its rungs are noisy. Extrapolating 10x always has uncertainty; Gulliver shows it instead of hiding it. Databricks,
 ClickHouse and Spark are not supported yet.
 
 ## Pipeline tools
