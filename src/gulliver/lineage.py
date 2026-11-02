@@ -85,7 +85,7 @@ def table_name(table: exp.Table) -> str:
 def load_models(models_dir: str | None = None, manifest: str | None = None) -> dict[str, Model]:
     models: dict[str, Model] = {}
     if manifest:
-        data = json.loads(Path(manifest).read_text())
+        data = json.loads(Path(manifest).read_text(encoding="utf-8"))
         for node in (data.get("nodes") or {}).values():
             if node.get("resource_type") != "model":
                 continue
@@ -104,7 +104,7 @@ def load_models(models_dir: str | None = None, manifest: str | None = None) -> d
             raise FileNotFoundError(f"Models folder not found: {models_dir}")
         for path in sorted(root.rglob("*.sql")):
             name = path.stem.lower()
-            sql, refs, sources = render(path.read_text(), name)
+            sql, refs, sources = render(path.read_text(encoding="utf-8"), name)
             models[name] = Model(name=name, sql=sql, path=str(path.relative_to(root)), refs=refs, sources=sources)
     return models
 

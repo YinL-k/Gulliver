@@ -27,7 +27,7 @@ def models(tmp_path):
     folder = tmp_path / "models"
     folder.mkdir()
     for name, sql in MODELS.items():
-        (folder / name).write_text(sql)
+        (folder / name).write_text(sql, encoding="utf-8")
     return str(folder)
 
 
@@ -38,6 +38,16 @@ def test_render_dbt_jinja():
                                 "m")
     assert refs == {"a"} and sources == {"s.t"}
     assert "config" not in sql and "{{" not in sql and "from m" in sql
+
+
+def test_load_models_reads_utf8_sql(tmp_path):
+    from gulliver.lineage import load_models
+
+    folder = tmp_path / "models"
+    folder.mkdir()
+    (folder / "cafe.sql").write_text("select 'café' as city from {{ source('raw','events') }}\n", encoding="utf-8")
+    loaded = load_models(str(folder))
+    assert "café" in loaded["cafe"].sql
 
 
 def test_lineage_overview(models):

@@ -20,7 +20,7 @@ EXIT = {"ok": 0, "warn": 0, "skipped": 0, "error": 1, "block": 2, "needs_rehears
 
 def _read_sql(args: argparse.Namespace) -> str:
     if getattr(args, "file", None):
-        return Path(args.file).read_text()
+        return Path(args.file).read_text(encoding="utf-8")
     if args.sql == "-" or (args.sql is None and not sys.stdin.isatty()):
         return sys.stdin.read()
     if not args.sql:
@@ -322,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
                         mode=args.mode, limit=args.limit)
             out_path = getattr(args, "output", None)
             if out_path and result.get("changes") and result.get("fixed_sql") is not None:
-                Path(out_path).write_text(result["fixed_sql"])
+                Path(out_path).write_text(result["fixed_sql"], encoding="utf-8")
             return _emit(result, args.json)
 
         if args.command in ("lineage", "impact"):

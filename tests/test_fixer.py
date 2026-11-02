@@ -265,12 +265,24 @@ def test_cli_fix(demo_db, state, capsys, tmp_path):
                  "select count(*) from events where date(ts) = '2025-01-02'"]) == 0
     listed = capsys.readouterr().out
     assert "returns exactly the same rows" in listed and out.is_file()
-    assert "ts >= '2025-01-02'" in out.read_text()
+    assert "ts >= '2025-01-02'" in out.read_text(encoding="utf-8")
     # no changes → do not create/overwrite the output file
     empty = tmp_path / "unchanged.sql"
     assert main(["fix", "--dialect", "duckdb", "-o", str(empty), "select count(*) from events"]) == 0
     assert "Nothing to rewrite" in capsys.readouterr().out
     assert not empty.exists()
+
+
+def test_cli_fix_utf8_sql_round_trip(demo_db, state, capsys, tmp_path):
+    """SQL files with non-ASCII text must round-trip as UTF-8 on every OS (#13)."""
+    src = tmp_path / "cafe.sql"
+    src.write_text("select 'café' as city, count(*) from events where date(ts) = '2025-01-02'\n", encoding="utf-8")
+    out = tmp_path / "cafe.fixed.sql"
+    assert main(["--dsn", demo_db, "fix", "-f", str(src), "-o", str(out)]) == 0
+    capsys.readouterr()
+    text = out.read_text(encoding="utf-8")
+    assert "café" in text
+    assert "ts >= '2025-01-02'" in text
 
 
 def test_mcp_fix_tool(demo_db, state, monkeypatch):
