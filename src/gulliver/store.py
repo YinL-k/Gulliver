@@ -4,6 +4,7 @@ Everything is plain JSON so people (and other tools) can read it.
   receipts/<id>.json    one per preflight, rehearsal and run
   ledger.jsonl          money and bytes actually spent, one line per execution
   approvals/<id>.json   written only by `gulliver approve <id>` (a human action)
+  audit.jsonl           hash chain over receipt and approval files (see audit.py, `gulliver audit verify`)
 """
 
 from __future__ import annotations
@@ -65,9 +66,17 @@ class Store:
         receipt.setdefault("created_at", iso(now_utc()))
         path = self.receipts_dir / f"{rid}.json"
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(receipt, indent=2, default=str))
+        text = json.dumps(receipt, indent=2, default=str)
+        tmp.write_text(text)
         os.replace(tmp, path)
+        self._audit("receipt", rid, text)
         return rid
+
+    def _audit(self, kind: str, item_id: str, text: str) -> None:
+        from .audit import append, content_hash
+
+        append(self.root / "audit.jsonl", {"at": iso(now_utc()), "kind": kind, "id": item_id,
+                                           "sha256": content_hash(text)})
 
     def load_receipt(self, receipt_id: str) -> dict[str, Any] | None:
         safe = Path(receipt_id).name
@@ -111,7 +120,9 @@ class Store:
             "max_cost_usd": receipt.get("gate", {}).get("cost_for_gate_usd"),
             "note": note,
         }
-        (self.approvals_dir / f"{Path(receipt_id).name}.json").write_text(json.dumps(approval, indent=2))
+        text = json.dumps(approval, indent=2)
+        (self.approvals_dir / f"{Path(receipt_id).name}.json").write_text(text)
+        self._audit("approval", Path(receipt_id).name, text)
         return approval
 
     def find_approval(self, sql_hash: str, connection: str) -> dict[str, Any] | None:
@@ -130,10 +141,12 @@ class Store:
 
     # -- ledger --------------------------------------------------------------------
     def record_spend(self, entry: dict[str, Any]) -> None:
+        """Append one hash-chained line, stamped with who asked (agent, session, task)."""
+        from .audit import append
+        from .identity import current
+
         self._ensure()
-        entry = {"at": iso(now_utc()), **entry}
-        with self.ledger_path.open("a") as fh:
-            fh.write(json.dumps(entry, default=str) + "\n")
+        append(self.ledger_path, {"at": iso(now_utc()), **current().fields(), **entry})
 
     def spent_today(self) -> dict[str, float]:
         today = now_utc().date()

@@ -126,6 +126,8 @@ class PostgresEngine(Engine):
                 max_bytes_billed: int | None = None) -> ExecResult:
         if timeout_s:
             self._run(f"SET statement_timeout = {int(timeout_s * 1000)}")
+        if self.tags:  # visible in pg_stat_activity and the server log while it runs
+            self._run("SELECT set_config('application_name', %s, false)", [application_name(self.tags)])
         start = time.perf_counter()
         preview: list[dict[str, Any]] = []
         total = 0
@@ -163,6 +165,12 @@ class PostgresEngine(Engine):
 
         kind = "BERNOULLI" if method == "bernoulli" else "SYSTEM"
         return f"TABLESAMPLE {kind} ({percent_text(fraction)}) REPEATABLE ({int(seed)})"
+
+
+def application_name(tags: dict[str, str]) -> str:
+    """gulliver:<receipt or kind>:<agent>, ASCII, within Postgres' 63-byte limit."""
+    text = ":".join(["gulliver", tags.get("receipt") or tags.get("kind") or "query", tags.get("agent") or ""])
+    return text.encode("ascii", "replace").decode()[:63].rstrip(":")
 
 
 def estimate_from_plan(plan_doc: Any, relation_bytes) -> Estimate:

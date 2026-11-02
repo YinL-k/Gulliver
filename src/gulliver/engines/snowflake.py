@@ -127,6 +127,8 @@ class SnowflakeEngine(Engine):
                 max_bytes_billed: int | None = None) -> ExecResult:
         if timeout_s:
             self._run(f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {max(1, int(timeout_s))}")
+        if self.tags:  # QUERY_TAG shows up in QUERY_HISTORY, so spend can be split per agent and receipt
+            self._run("ALTER SESSION SET QUERY_TAG = %s", [json.dumps(self.tags, sort_keys=True)[:2000]])
         start = time.perf_counter()
         preview: list[dict[str, Any]] = []
         total = 0
@@ -163,6 +165,34 @@ class SnowflakeEngine(Engine):
         return ExecResult(columns=columns, preview=preview, rows=total, elapsed_s=elapsed, bytes_processed=scanned,
                           cost_usd=self.cost_for(None, elapsed), truncated=total > len(preview),
                           notes=["cost assumes the warehouse runs only this query; resumes bill at least 60s"])
+
+    def data_version(self, tables: list[str]) -> str | None:
+        """LAST_ALTERED (moves on every DML and DDL) + rows + bytes of each base table; None for views,
+        external and dynamic tables."""
+        if not tables:
+            return None
+        parts = []
+        for ref in tables:
+            try:
+                node = sqlglot.parse_one(f"SELECT * FROM {ref}", read="snowflake").find(exp.Table)
+            except sqlglot.errors.ParseError:
+                return None
+            if node is None or not isinstance(node.this, exp.Identifier) or node.catalog:
+                return None  # another database's information_schema: not checked here
+            query = ("SELECT table_type, last_altered, row_count, bytes FROM information_schema.tables "
+                     "WHERE table_name = %s")
+            params: list[Any] = [node.name.upper()]
+            if node.db:
+                query += " AND table_schema = %s"
+                params.append(node.db.upper())
+            try:
+                rows = self._run(query, params)
+            except EngineError:
+                return None
+            if len(rows) != 1 or str(rows[0][0]).upper() != "BASE TABLE" or rows[0][1] is None:
+                return None
+            parts.append(f"{ref}:{rows[0][1]}:{rows[0][2]}:{rows[0][3]}")
+        return "snowflake:" + "|".join(parts)
 
     def md5_int(self, text_expr: str) -> str:
         return f"TO_NUMBER(SUBSTR(MD5({text_expr}), 1, 7), 'XXXXXXX')"

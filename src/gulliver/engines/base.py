@@ -84,6 +84,8 @@ class Engine(ABC):
         self.connection = connection
         self.params = connection.params
         self.read_only = read_only
+        #: labels for the next execute (who, why, which receipt); engines attach them where they can
+        self.tags: dict[str, str] = {}
 
     # -- lifecycle -----------------------------------------------------------------
     def close(self) -> None:  # pragma: no cover - trivial
@@ -120,6 +122,11 @@ class Engine(ABC):
 
     def supported_methods(self) -> tuple[str, ...]:
         return ("system", "bernoulli")
+
+    def data_version(self, tables: list[str]) -> str | None:
+        """A value that changes whenever the data in these tables changes, or None when there is no
+        reliable signal. The runaway guard only reuses an earlier result when this is not None."""
+        return None
 
     def cost_for(self, bytes_processed: int | None, runtime_s: float | None) -> float | None:
         """Money for a run with these measurements. Free engines return 0."""

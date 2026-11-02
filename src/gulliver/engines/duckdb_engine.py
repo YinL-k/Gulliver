@@ -149,6 +149,42 @@ class DuckDBEngine(Engine):
             info.notes.append("no files matched the path")
         return info
 
+    def data_version(self, tables: list[str]) -> str | None:
+        """File stamps (mtime + size) of the database file, its WAL and any files read directly.
+        None for in-memory databases, views, attached databases and remote files: no reliable signal."""
+        if self.path == ":memory:" or not tables:
+            return None
+        stamps: list[str] = []
+        uses_db = False
+        main_db = (self.con.execute("SELECT current_database()").fetchone() or [""])[0]
+        for ref in tables:
+            try:
+                node = sqlglot.parse_one(f"SELECT * FROM {ref}", read="duckdb").find(exp.Table)
+            except sqlglot.errors.ParseError:
+                return None
+            if node is None:
+                return None
+            if not isinstance(node.this, exp.Identifier):
+                literals = [a for a in node.this.iter_expressions() if isinstance(a, exp.Literal) and a.is_string]
+                if len(literals) != 1:
+                    return None
+                path = literals[0].this
+                files = sorted(glob.glob(path)) if any(ch in path for ch in "*?[") else [path]
+                if not files or not all(os.path.isfile(f) for f in files):
+                    return None
+                stamps += [_stamp(f) for f in files]
+                continue
+            if node.catalog and node.catalog.lower() != str(main_db).lower():
+                return None
+            view = self.con.execute("SELECT 1 FROM duckdb_views() WHERE NOT internal AND lower(view_name) = lower(?)",
+                                    [node.name]).fetchone()
+            if view:
+                return None
+            uses_db = True
+        if uses_db:
+            stamps += [_stamp(self.path), _stamp(self.path + ".wal")]
+        return "duckdb:" + "|".join(stamps)
+
     # -- estimation ----------------------------------------------------------------
     def _plan(self, sql: str) -> list[dict[str, Any]]:
         try:
@@ -247,6 +283,14 @@ class DuckDBEngine(Engine):
 
         method = "bernoulli" if method == "bernoulli" else "system"
         return f"TABLESAMPLE {percent_text(fraction)}% ({method}, {int(seed)})"
+
+
+def _stamp(path: str) -> str:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return f"{path}:none"
+    return f"{path}:{st.st_mtime_ns}:{st.st_size}"
 
 
 def _walk(nodes: list[dict[str, Any]]):
