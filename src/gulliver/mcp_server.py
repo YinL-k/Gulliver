@@ -44,6 +44,7 @@ More tools for pipelines:
 - gulliver_translate: SQL between DuckDB, Postgres, BigQuery and Snowflake.
 - gulliver_incremental: turn a full-rebuild model into an incremental one, with the rows it saves.
 - gulliver_check: data quality (unique, not null, accepted values, range, freshness, row count) in one scan.
+- gulliver_top: the most expensive repeated queries from query history, with priced same-rows fixes.
 
 Every result has `status` and `next_step`. Follow next_step. Status block means: do not try to work around it,
 change the SQL. Only SELECT, and CREATE/INSERT ... SELECT (when a human enabled writes), are accepted."""
@@ -279,6 +280,31 @@ def _register_feature_tools(server: Any) -> None:
     ) -> dict[str, Any]:
         return _guard(features.check, target, connection=connection, where=where, unique=unique, not_null=not_null,
                       accepted=accepted, ranges=ranges, fresh=fresh, min_rows=min_rows, max_change_pct=max_change_pct)
+
+    @server.tool(name="gulliver_top", annotations=RUNS_QUERIES,
+                 description="Workload review: the most expensive repeated queries (grouped by shape, literals "
+                             "ignored) from Gulliver's receipts, pg_stat_statements, BigQuery JOBS_BY_PROJECT, "
+                             "Snowflake QUERY_HISTORY or a CSV/JSONL file. For the top ones: lint, a same-rows "
+                             "rewrite and the saving per month (labeled exact or heuristic), plus repeated "
+                             "aggregates worth a summary table. The history query is budget-gated.")
+    def gulliver_top(
+        source: Annotated[str, Field(description="auto (the connection's own history), receipts, "
+                                                 "pg_stat_statements, bigquery_jobs, snowflake_history or file.")] = "auto",
+        connection: CONNECTION = None,
+        path: Annotated[str | None, Field(description="CSV / JSONL / JSON file for source 'file' (absolute path; "
+                                                      "columns query, calls, bytes, runtime_s, cost_usd).")] = None,
+        days: Annotated[int, Field(description="History window in days.", ge=1, le=365)] = 7,
+        limit: Annotated[int, Field(description="Query groups to return.", ge=1, le=200)] = 20,
+        analyze: Annotated[int, Field(description="Top groups to lint, rewrite and price.", ge=0, le=50)] = 10,
+        rank_by: Annotated[Literal["auto", "cost", "runtime", "bytes", "calls"],
+                           Field(description="auto: cost when known, else runtime.")] = "auto",
+        dialect: Annotated[Literal["duckdb", "postgres", "bigquery", "snowflake"] | None,
+                           Field(description="Dialect of the SQL in a file. Omit for the connection's.")] = None,
+    ) -> dict[str, Any]:
+        from . import workload
+
+        return _guard(workload.top, source=source, connection=connection, days=days, limit=limit, analyze=analyze,
+                      rank_by=rank_by, path=path, dialect=dialect)
 
 
 def tool_schemas() -> list[dict[str, Any]]:

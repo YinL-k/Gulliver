@@ -262,6 +262,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-rows", type=int)
     p.add_argument("--max-change", type=float, help="Max %% row-count change since the last check")
 
+    p = sub.add_parser("top", help="Most expensive repeated queries, with priced same-rows fixes")
+    p.add_argument("--source", default="auto",
+                   help="auto, receipts, pg_stat_statements, bigquery_jobs, snowflake_history, csv:FILE or jsonl:FILE")
+    p.add_argument("--file", dest="path", help="CSV / JSONL / JSON export (columns: query, calls, bytes, ...)")
+    p.add_argument("--days", type=int, default=7, help="History window in days (default 7)")
+    p.add_argument("--limit", type=int, default=20, help="Query groups to list (default 20)")
+    p.add_argument("--analyze", type=int, default=10, help="Top groups to lint, fix and price (default 10)")
+    p.add_argument("--rank-by", choices=["auto", "cost", "runtime", "bytes", "calls"], default="auto")
+    p.add_argument("--dialect", default=None, help="Dialect of the SQL in a file (default: connection's)")
+
     p = sub.add_parser("tools", help="Print tool definitions for MCP, OpenAI or Gemini function calling")
     p.add_argument("--format", choices=["mcp", "openai", "gemini"], default="mcp")
 
@@ -339,6 +349,15 @@ def main(argv: list[str] | None = None) -> int:
 
         settings = load_settings(config_path=args.config, dsn=args.dsn)
         conn = args.connection
+        if args.command == "top":
+            from . import workload
+
+            result = workload.top(settings, source=args.source, connection=conn, days=args.days, limit=args.limit,
+                                  analyze=args.analyze, rank_by=args.rank_by, path=args.path, dialect=args.dialect)
+            if not args.json:
+                print(workload.render_text(result))
+                return EXIT.get(str(result.get("status")), 1)
+            return _emit(result, args.json)
         if args.command in ("snapshot", "drift", "translate", "diff", "incremental", "check"):
             from . import features
 
