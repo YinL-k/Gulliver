@@ -579,8 +579,8 @@ def _sandbox_checks(conn: Connection) -> list[dict[str, Any]]:
             outside = os.path.join(tmp, "outside.csv")
             with open(outside, "w", encoding="utf-8") as fh:
                 fh.write("secret\n42\n")
-            real = os.path.realpath(outside)
-            roots = [os.path.realpath(r) for r in allowed_roots(conn)]
+            real = os.path.normcase(os.path.realpath(outside))
+            roots = [os.path.normcase(os.path.realpath(r)) for r in allowed_roots(conn)]
             if any(real.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
                 add(name, None, f"the temp folder {tmp} is inside allowed_paths, so it cannot test this")
             else:
