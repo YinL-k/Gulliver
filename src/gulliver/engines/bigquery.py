@@ -12,6 +12,7 @@ or GOOGLE_APPLICATION_CREDENTIALS). Nothing is stored by Gulliver.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -122,6 +123,8 @@ class BigQueryEngine(Engine):
         cfg: dict[str, Any] = {"use_query_cache": False}
         if max_bytes_billed:
             cfg["maximum_bytes_billed"] = int(max(max_bytes_billed, MIN_BILLED_PER_TABLE))
+        if self.tags:  # job labels show up in INFORMATION_SCHEMA.JOBS and the billing export
+            cfg["labels"] = job_labels(self.tags)
         start = time.perf_counter()
         try:
             job = self.client.query(sql, job_config=self._job_config(**cfg))
@@ -142,6 +145,24 @@ class BigQueryEngine(Engine):
                           bytes_processed=int(processed) if processed is not None else None,
                           cost_usd=self.cost_for(int(billed), None) if billed is not None else None,
                           truncated=total > len(preview))
+
+    def data_version(self, tables: list[str]) -> str | None:
+        """lastModifiedTime + rows + bytes of each base table. None for views, external tables, wildcard
+        tables and tables with a streaming buffer (streamed rows do not move lastModifiedTime reliably)."""
+        if not tables:
+            return None
+        parts = []
+        for ref in tables:
+            try:
+                table = self.client.get_table(ref.strip("`"))
+            except Exception:
+                return None
+            kind = str(getattr(table, "table_type", "TABLE") or "TABLE").upper()
+            modified = getattr(table, "modified", None)
+            if kind != "TABLE" or modified is None or getattr(table, "streaming_buffer", None) is not None:
+                return None
+            parts.append(f"{ref}:{modified}:{getattr(table, 'num_rows', None)}:{getattr(table, 'num_bytes', None)}")
+        return "bigquery:" + "|".join(parts)
 
     def baseline_latency(self, tries: int = 1) -> float:
         return super().baseline_latency(tries=1)
@@ -165,6 +186,18 @@ class BigQueryEngine(Engine):
         from ..sampling import percent_text
 
         return f"TABLESAMPLE SYSTEM ({percent_text(fraction)} PERCENT)"
+
+
+def job_labels(tags: dict[str, str]) -> dict[str, str]:
+    """BigQuery label rules: lowercase letters, digits, '_' and '-', at most 63 characters."""
+    def norm(text: str) -> str:
+        return re.sub(r"[^a-z0-9_-]+", "-", str(text).lower()).strip("-")[:63]
+
+    labels = {"gulliver": norm(tags.get("kind") or "query")}
+    for key in ("agent", "session", "task", "receipt"):
+        if tags.get(key):
+            labels[f"gulliver_{key}"] = norm(tags[key])
+    return labels
 
 
 def _bq_error(exc: Exception) -> str:

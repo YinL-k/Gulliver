@@ -49,3 +49,11 @@ def test_unparsable_sql_is_blocked():
 
 def test_fingerprint_ignores_whitespace_and_case():
     assert sql_fingerprint("SELECT  a\nFROM t;") == sql_fingerprint("select a from t")
+
+
+def test_sql_that_cannot_be_tokenized_is_blocked_not_raised():
+    # Postgres normalized text keeps `$1,$2` unspaced, which sqlglot reads as a dollar quote; an open quote too
+    for sql, dialect in (("SELECT * FROM t WHERE a IN ($1,$2)", "postgres"),
+                         ("SELECT g FROM generate_series($3,$4) g", "postgres"), ("SELECT 'oops AS a", "duckdb")):
+        st = classify(sql, dialect)
+        assert st.kind == "block" and "Could not parse" in st.reason

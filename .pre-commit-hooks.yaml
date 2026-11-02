@@ -1,0 +1,24 @@
+# pre-commit hooks for Gulliver (https://pre-commit.com).
+#
+#   repos:
+#     - repo: https://github.com/laaielichter/Gulliver
+#       rev: main        # or a release tag that includes these hooks
+#       hooks:
+#         - id: gulliver-lint
+#         - id: gulliver-fix          # needs a connection for column types: args: [--dsn, warehouse.duckdb]
+#
+# Settings come from [lint] in gulliver.toml (disable, severity, fail_on, exclude, dialect).
+- id: gulliver-lint
+  name: gulliver lint (SQL scale lint)
+  description: Find SQL that is fine on small data and expensive on big data. Fails on findings at or above fail_on.
+  entry: gulliver lint
+  language: python
+  types: [sql]
+  require_serial: true
+- id: gulliver-fix
+  name: gulliver fix (same-rows rewrites only)
+  description: Rewrite SQL in place only where Gulliver can prove the rows stay exactly the same.
+  entry: gulliver fix --write
+  language: python
+  types: [sql]
+  require_serial: true

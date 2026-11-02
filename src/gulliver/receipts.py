@@ -98,8 +98,14 @@ def render_markdown(rec: dict[str, Any]) -> str:
 
     if rec.get("approval"):
         a = rec["approval"]
-        lines += ["## Approval", "", f"Approved by a human at {a.get('approved_at')} "
+        how = ("in the MCP client (elicitation" + (f", client `{a['client']}`" if a.get("client") else "") + ")"
+               if a.get("channel") == "elicitation" else "with `gulliver approve`")
+        lines += ["## Approval", "", f"Approved by a human {how} at {a.get('approved_at')} "
                   f"(receipt `{a.get('receipt_id')}`)." + (f" Note: {a['note']}" if a.get("note") else ""), ""]
+    if rec.get("approval_request"):
+        r = rec["approval_request"]
+        lines += ["## Approval request", "", f"Asked the human in the MCP client: **{r.get('answer')}**."
+                  + (f" {r['reason']}" if r.get("reason") else ""), ""]
 
     actual = rec.get("actual")
     if actual:
@@ -114,6 +120,18 @@ def render_markdown(rec: dict[str, Any]) -> str:
             for key, c in comp.items():
                 lines.append(f"| {key} | {c['predicted']} | {c['actual']} | {c['ratio']} |")
             lines.append("")
+
+    if rec.get("sensitive_columns") or rec.get("data_warnings") or rec.get("truncated_by"):
+        lines += ["## Result guard", ""]
+        for c in rec.get("sensitive_columns") or []:
+            lines.append(f"- `{c['column']}`: {c['kind']} ({c['category']}), found by {c['detected_by']}, "
+                         f"policy **{c['action']}**")
+        lines += [f"- Warning: {w}" for w in rec.get("data_warnings") or []]
+        if rec.get("truncated_by"):
+            lines.append(f"- Preview cut by {rec['truncated_by']}")
+        if "preview" in rec:
+            lines += ["", "The preview in this receipt was stored after masking."]
+        lines.append("")
 
     if rec.get("checks"):
         lines += ["## Data quality checks", "", "| Check | Column | Result | Detail |", "|---|---|---|---|"]

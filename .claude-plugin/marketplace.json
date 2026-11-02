@@ -10,8 +10,8 @@
     {
       "name": "gulliver",
       "source": "./",
-      "description": "Preflight, rehearse and budget SQL on big data; impact, drift, data-diff, translate, incremental advice and quality checks.",
-      "version": "0.2.0"
+      "description": "Preflight, rehearse and budget SQL on big data, with a read-only gate and guards for personal data and loops; impact, drift, data-diff, translate, incremental advice, quality checks, top costly queries and PR review.",
+      "version": "0.3.0"
     }
   ]
 }

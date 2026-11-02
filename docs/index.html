@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Gulliver: test agent SQL on tiny data before it runs on giant data</title>
-<meta name="description" content="Gulliver is an open-source MCP server and CLI that lets AI agents estimate the cost of SQL, rehearse it on 1%, 3% and 10% samples, predict the full run and only run it inside a budget. DuckDB, Postgres, BigQuery, Snowflake.">
+<meta name="description" content="Gulliver is an open-source MCP server and CLI that lets AI agents estimate the cost of SQL, rehearse it on 1%, 3% and 10% samples, predict the full run and only run it inside a budget, with a read-only gate and guards for personal data and loops. DuckDB, Postgres, BigQuery, Snowflake.">
 <meta property="og:title" content="Gulliver: a dress rehearsal for agent SQL">
 <meta property="og:description" content="Estimate the cost, rehearse on 1% of the data, predict 100%, and only run inside a budget. MCP server + CLI for Claude Code, Codex, Cursor, Gemini CLI and any agent.">
 <meta property="og:image" content="https://laaielichter.github.io/Gulliver/og.png">
@@ -12,7 +12,7 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Gulliver">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="keywords" content="MCP server, AI agents, SQL, cost estimate, dry run, sampling, scale lint, query optimization, text-to-SQL, data engineering, data quality, data lineage, DuckDB, Postgres, BigQuery, Snowflake, dbt, Claude Code, Codex, Cursor, Gemini CLI">
+<meta name="keywords" content="MCP server, AI agents, SQL, cost estimate, dry run, sampling, scale lint, query optimization, text-to-SQL, data engineering, data quality, data lineage, DuckDB, Postgres, BigQuery, Snowflake, dbt, SARIF, pre-commit, GitHub Action, PII, prompt injection, Claude Code, Codex, Cursor, Gemini CLI">
 <link rel="canonical" href="https://laaielichter.github.io/Gulliver/">
 <meta name="theme-color" content="#EDF1EF" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0F1C27" media="(prefers-color-scheme: dark)">
@@ -42,7 +42,8 @@
    "name": "laaielichter",
    "url": "https://github.com/laaielichter"
   },
-  "keywords": "MCP server, AI agents, SQL, cost estimate, scale lint, query optimization, data engineering, DuckDB, Postgres, BigQuery, Snowflake"
+  "keywords": "MCP server, AI agents, SQL, cost estimate, scale lint, query optimization, data engineering, SARIF, pre-commit, GitHub Action, PII, prompt injection, security, DuckDB, Postgres, BigQuery, Snowflake",
+  "softwareVersion": "0.3.0"
  },
  {
   "@context": "https://schema.org",
@@ -274,7 +275,7 @@ footer{padding:40px 0 60px;border-top:1px solid var(--rule);color:var(--ink-2);f
 <main id="top">
 <div class="hero">
   <div>
-    <a class="news" href="https://github.com/laaielichter/Gulliver/blob/main/CHANGELOG.md"><span>New in 0.2.0</span> It rewrites slow SQL, with a same-rows guarantee</a>
+    <a class="news" href="https://github.com/laaielichter/Gulliver/blob/main/CHANGELOG.md"><span>New in 0.3.0</span> A stronger read-only gate, guards for personal data and loops, and a PR review</a>
     <h1>Test on tiny data before you run on giant data.</h1>
     <p class="lede">Gulliver is an MCP server and CLI that gives AI agents a dress rehearsal for SQL. It estimates the cost, runs the query on 1%, 3% and 10% of the data, predicts the full run, and only lets it run inside your budget.</p>
     <div class="install">
@@ -291,12 +292,12 @@ footer{padding:40px 0 60px;border-top:1px solid var(--rule);color:var(--ink-2);f
   <figure class="ladder" id="ladder" aria-labelledby="ladder-title">
     <h2 id="ladder-title">A rehearsal of an agent's self-join</h2>
     <p class="q mono">events a join events b on user_id, 5 million rows</p>
-    <div class="row"><span class="f">1%</span><div class="track"><div class="bar" style="--w:14%"></div></div><span class="n">41,862 rows</span></div>
-    <div class="row"><span class="f">3%</span><div class="track"><div class="bar" style="--w:30%"></div></div><span class="n">214,092 rows</span></div>
-    <div class="row"><span class="f">10%</span><div class="track"><div class="bar" style="--w:53%"></div></div><span class="n">2.3 M rows</span></div>
-    <div class="row pred"><span class="f">100%</span><div class="track"><div class="bar" style="--w:91%"></div><div class="range" style="left:84%;width:13%"></div></div><span class="n">≈ 120 M rows</span></div>
-    <p class="axis">Bars on a log scale. The 100% bar is a prediction, with its range.</p>
-    <p class="verdict">Output grows with exponent <b>1.75</b>, faster than the data. Gulliver flags the join before the full run, not after the bill.</p>
+    <div class="row"><span class="f">1%</span><div class="track"><div class="bar" style="--w:58%"></div></div><span class="n">2.5 M rows</span></div>
+    <div class="row"><span class="f">3%</span><div class="track"><div class="bar" style="--w:68%"></div></div><span class="n">7.6 M rows</span></div>
+    <div class="row"><span class="f">10%</span><div class="track"><div class="bar" style="--w:78%"></div></div><span class="n">25.5 M rows</span></div>
+    <div class="row pred"><span class="f">100%</span><div class="track"><div class="bar" style="--w:98%"></div><div class="range" style="left:95%;width:5%"></div></div><span class="n">≈ 257 M rows</span></div>
+    <p class="axis">Bars on a log scale. The 100% bar is a prediction, with its range. The real run returned 254,966,150 rows.</p>
+    <p class="verdict">The output is 51 times the biggest table: the join on <code>user_id</code> multiplies rows. Gulliver flags it before the full run, not after the bill.</p>
   </figure>
 </div>
 
@@ -305,7 +306,7 @@ footer{padding:40px 0 60px;border-top:1px solid var(--rule);color:var(--ink-2);f
   <p class="sub">Every answer carries a <code>status</code> and a <code>next_step</code>, so even a small model knows what to do. Limits are set by a human in <code>gulliver.toml</code>; the agent cannot raise them or approve itself.</p>
   <ol class="steps">
     <li><span class="k">inspect</span><h3>See what is big</h3><p>Rows, bytes, partitions and columns, from metadata only. Free.</p></li>
-    <li><span class="k">preflight</span><h3>Price it first</h3><p>Bytes, rows and money without running, plus 13 scale-lint rules.</p></li>
+    <li><span class="k">preflight</span><h3>Price it first</h3><p>Bytes, rows and money without running, plus 15 scale-lint rules and a read-only gate.</p></li>
     <li><span class="k">rehearse</span><h3>Try it small</h3><p>Runs on 1%, 3%, 10% samples and predicts 100% with a range.</p></li>
     <li><span class="k">run</span><h3>Run inside budget</h3><p>Per-query and daily limits. Above a threshold a human approves.</p></li>
     <li><span class="k">receipt</span><h3>Show the proof</h3><p>Estimated, rehearsed, approved, run: predicted versus actual.</p></li>
@@ -315,7 +316,7 @@ footer{padding:40px 0 60px;border-top:1px solid var(--rule);color:var(--ink-2);f
 <section aria-labelledby="demo-h">
   <h2 class="sec" id="demo-h">The real CLI, on a real table</h2>
   <p class="sub">Recorded on the 5-million-row demo database that <code>gulliver demo</code> builds in seconds. Nothing in this recording is staged.</p>
-  <div class="demo"><img src="demo.svg" alt="Terminal recording: Gulliver inspects the demo tables, rehearses a self-join on 1%, 3% and 10% and predicts about 120 million output rows, then rewrites a DATE(ts) filter into a range on ts with the same rows." loading="lazy" width="1568" height="566"></div>
+  <div class="demo"><img src="demo.svg" alt="Terminal recording: Gulliver inspects the demo tables, rehearses a self-join on 1%, 3% and 10% and predicts the size of the full result, then rewrites a DATE(ts) filter into a range on ts with the same rows." loading="lazy" width="1292" height="458"></div>
   <p class="cap">Script: <a href="https://github.com/laaielichter/Gulliver/blob/main/docs/demo.sh">docs/demo.sh</a></p>
 </section>
 
@@ -389,7 +390,7 @@ gulliver tools --format openai   # function definitions for any API</code></pre>
 
 <section aria-labelledby="tools-h">
   <h2 class="sec" id="tools-h">Also for the pipeline around the query</h2>
-  <p class="sub">Fourteen MCP tools in total, each also a CLI command with <code>--json</code>.</p>
+  <p class="sub">Sixteen MCP tools in total, each also a CLI command with <code>--json</code>. <code>--toolset core</code> loads only the eight query tools.</p>
   <div class="tools">
     <div><code>gulliver_impact</code><span>What breaks if you change or drop a column: column-level lineage over SQL models or a dbt manifest.</span></div>
     <div><code>gulliver_drift</code><span>Columns removed, retyped or added since the last snapshot, and the models they break.</span></div>
@@ -397,12 +398,15 @@ gulliver tools --format openai   # function definitions for any API</code></pre>
     <div><code>gulliver_translate</code><span>SQL between DuckDB, Postgres, BigQuery and Snowflake, with warnings.</span></div>
     <div><code>gulliver_incremental</code><span>Can a full-rebuild model be incremental? The SQL, the dbt config and the rows it saves.</span></div>
     <div><code>gulliver_check</code><span>Unique keys, not null, accepted values, ranges, freshness and row-count jumps in one scan.</span></div>
+    <div><code>gulliver_top</code><span>The most expensive repeated queries from query history, with same-rows fixes priced per month.</span></div>
+    <div><code>gulliver_review</code><span>A PR gate for SQL models: new lint, breaking changes, downstream impact and cost per month. Also a GitHub Action.</span></div>
+    <div><code>gulliver lint models/</code><span>Lint every SQL file in CI: SARIF, GitHub, GitLab and JUnit output, inline ignores, pre-commit hooks.</span></div>
   </div>
 </section>
 
 <section id="compare" aria-labelledby="cmp-h">
   <h2 class="sec" id="cmp-h">How it compares</h2>
-  <p class="sub">Based on each project's public docs in October 2026. If something is out of date, <a href="https://github.com/laaielichter/Gulliver/issues/new">open an issue</a>.</p>
+  <p class="sub">Based on each project's public docs in November 2026. If something is out of date, <a href="https://github.com/laaielichter/Gulliver/issues/new">open an issue</a>.</p>
   <div class="scroll">
   <table class="cmp">
     <thead><tr><th scope="col"></th><th scope="col">Gulliver</th><th scope="col">cost-guard-mcp</th><th scope="col">Database MCP servers</th><th scope="col">dbt-mcp, dbt --sample</th></tr></thead>
@@ -411,6 +415,9 @@ gulliver tools --format openai   # function definitions for any API</code></pre>
       <tr><th scope="row">Rehearse on samples, predict 100%</th><td>Yes</td><td>No</td><td>No</td><td>dbt only, time windows</td></tr>
       <tr><th scope="row">Auto-fix with a same-rows guarantee</th><td>Yes</td><td>No</td><td>No</td><td>No</td></tr>
       <tr><th scope="row">Budget gate, human approval, receipt</th><td>Yes</td><td>No</td><td>Read-only modes</td><td>No</td></tr>
+      <tr><th scope="row">Blocks side-effect functions and file access in a SELECT</th><td>Yes, plus a DuckDB engine sandbox</td><td>No</td><td>Varies; a read-only database user is strongest</td><td>No</td></tr>
+      <tr><th scope="row">Personal data and prompt injection in results</th><td>Masked or flagged, rows marked untrusted</td><td>No</td><td>Some wrap results with a warning</td><td>No</td></tr>
+      <tr><th scope="row">Lint and cost review on pull requests</th><td>SARIF, GitHub Action</td><td>No</td><td>No</td><td>No</td></tr>
       <tr><th scope="row">Engines</th><td>DuckDB, Postgres, BigQuery and Snowflake (beta)</td><td>BigQuery, Snowflake, Databricks</td><td>Many</td><td>dbt projects</td></tr>
     </tbody>
   </table>
@@ -439,8 +446,8 @@ gulliver tools --format openai   # function definitions for any API</code></pre>
       <p class="sub">Ideas, not promises. Each one is open for help.</p>
       <ol class="road">
         <li>Live tests for BigQuery and Snowflake, so they can leave beta.</li>
-        <li>More same-rows rewrites, such as <code>DATE_TRUNC('quarter', ts)</code> (<a href="https://github.com/laaielichter/Gulliver/issues/4">#4</a>).</li>
-        <li>A lint rule for <code>LIKE</code> with a leading wildcard (<a href="https://github.com/laaielichter/Gulliver/issues/5">#5</a>).</li>
+        <li>A Postgres check for user functions in untrusted languages or with <code>SECURITY DEFINER</code> (GS005).</li>
+        <li>More same-rows rewrites in <code>gulliver_fix</code>.</li>
         <li>Databricks and ClickHouse engines.</li>
       </ol>
     </div>

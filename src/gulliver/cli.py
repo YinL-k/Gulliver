@@ -53,6 +53,15 @@ def _print_human(result: dict[str, Any]) -> None:
             if result.get("truncated"):
                 print(f"... ({result.get('actual', {}).get('rows', '?')} rows in total)")
         return
+    if "sensitive_tables" in result:
+        for t in result["sensitive_tables"]:
+            print(f"{t['name']}: " + ("nothing sensitive found" if not t["sensitive_columns"] else ""))
+            for c in t["sensitive_columns"]:
+                print(f"  {c['column']:30} {c['kind']:7} {c['category']:12} {c['action']:6} ({c['detected_by']})")
+        for note in result.get("notes") or []:
+            print(f"note: {note}")
+        print(f"\nnext: {result.get('next_step', '')}")
+        return
     if "tables" in result and isinstance(result["tables"], list):
         print(f"{'table':40} {'rows':>14} {'bytes':>12}  partitioned_by")
         for t in result["tables"]:
@@ -68,15 +77,25 @@ def _print_human(result: dict[str, Any]) -> None:
         if t.get("clustered_by"):
             print(f"clustered by: {t['clustered_by']}")
         for c in t.get("columns") or []:
-            print(f"  {c['name']:30} {c['type']}")
+            tag = c.get("sensitive")
+            print(f"  {c['name']:30} {c['type']}" + (f"  [{tag['kind']}: {tag['category']}, {tag['action']}]"
+                                                     if tag else ""))
         print(f"\nnext: {result.get('next_step', '')}")
         return
     if "fixed_sql" in result:
         changes = result.get("changes") or []
         if not changes:
             print("Nothing to rewrite automatically.")
+        from .verify import human_lines
+
         for c in changes:
             print(f"{c['rule']} [{c['meaning']}]\n  before: {c['before']}\n  after:  {c['after']}\n  why:    {c['note']}")
+            for line in human_lines(c):
+                print(line)
+        for c in result.get("dropped") or []:
+            print(f"DROPPED {c['rule']} (claimed the same rows, but generated data disagrees)")
+            for line in human_lines(c):
+                print(line)
         if changes:
             print("\n-- fixed SQL\n" + result["fixed_sql"])
         if (result.get("saving") or {}).get("summary"):
@@ -139,6 +158,7 @@ def _add_common(p: argparse.ArgumentParser, defaults: bool) -> None:
     p.add_argument("--config", help="Path to gulliver.toml (default: ./gulliver.toml or $GULLIVER_CONFIG)", **extra)
     p.add_argument("--dsn", help="Connection string: file.duckdb, postgresql://..., bigquery://project, ...", **extra)
     p.add_argument("-c", "--connection", help="Connection name from gulliver.toml", **extra)
+    p.add_argument("--agent", help="Who is asking (ledger, per-agent budget, query tags); GULLIVER_AGENT wins", **extra)
     if defaults:
         p.add_argument("--json", action="store_true", help="Print JSON (for agents and scripts)")
     else:
@@ -175,19 +195,45 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("inspect", help="Biggest tables, or one table's columns")
     p.add_argument("table", nargs="?")
     p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--sensitive", action="store_true",
+                   help="List columns that look like personal data or secrets (by name and earlier values)")
+    p.add_argument("--scan", type=int, default=0, metavar="ROWS",
+                   help="With --sensitive: also check this many rows of text values (one budget-gated query)")
 
-    p = sub.add_parser("lint", help="Scale lint only (no database needed)")
-    _add_sql_args(p)
+    p = sub.add_parser("lint", help="Scale lint only (no database needed): one SQL string, or files and folders")
+    p.add_argument("sql", nargs="*", help="SQL text, '-' to read stdin, or .sql files and folders (CI mode)")
+    p.add_argument("-f", "--file", help="Read one SQL statement from a file")
     p.add_argument("--dialect", default=None, help="duckdb, postgres, bigquery or snowflake")
+    p.add_argument("--format", choices=["text", "json", "sarif", "github", "gitlab", "junit"], default=None,
+                   help="Files mode output (default text; --json = json)")
+    p.add_argument("--fail-on", choices=["error", "warn", "info", "never"], default=None,
+                   help="Files mode: exit 2 when a finding is at least this severe (default error, or [lint] fail_on)")
+    p.add_argument("--exclude", action="append", metavar="GLOB", help="Files mode: skip matching paths (repeatable)")
+    p.add_argument("--warn-unused-ignores", action="store_true", help="Files mode: report ignore comments that "
+                                                                      "ignore nothing (GV901)")
+    p.add_argument("--metadata", action="store_true", help="Files mode: read table metadata from the connection "
+                                                           "(partitions for GV004, column types for same-rows fixes)")
+    p.add_argument("-o", "--output", metavar="PATH", help="Files mode: write the report to PATH (e.g. gulliver.sarif)")
+
+    sub.add_parser("rules", help="List the lint rules (id, name, default severity, autofix)")
 
     p = sub.add_parser("fix", help="Rewrite SQL to be cheaper, and say if the rows stay exactly the same")
-    _add_sql_args(p)
+    p.add_argument("sql", nargs="*", help="SQL text, '-' to read stdin, or .sql files and folders with --check/--write")
+    p.add_argument("-f", "--file", help="Read the SQL from a file")
+    p.add_argument("--check", action="store_true", help="Files: exit 2 when a same-rows rewrite exists (CI)")
+    p.add_argument("--write", action="store_true", help="Files: apply same-rows rewrites in place")
     p.add_argument("--dialect", default=None, help="duckdb, postgres, bigquery or snowflake (default: connection's)")
     p.add_argument("--mode", choices=["safe", "all"], default="safe",
                    help="safe: same rows only (default). all: also LIMIT, approx count, UNION ALL, NOT EXISTS")
     p.add_argument("--limit", type=int, default=None, help="Row limit to add in --mode all")
     p.add_argument("-o", "--output", metavar="PATH",
                    help="Write the rewritten SQL to PATH when there are changes (still prints the change list)")
+    p.add_argument("--verify", action="store_true",
+                   help="Test every change on generated edge-case data in a private in-memory DuckDB")
+    p.add_argument("--cases", type=int, default=None, help="Generated cases for --verify (default 200)")
+    p.add_argument("--seed", type=int, default=0, help="Seed for --verify; the same seed gives the same cases")
+    p.add_argument("--timezone", default=None,
+                   help="Session time zone for --verify (default: try several, incl. daylight-saving ones)")
 
     p = sub.add_parser("preflight", help="Estimate cost and size without running")
     _add_sql_args(p)
@@ -195,7 +241,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rehearse", help="Run on 1%%, 3%%, 10%% samples and predict the full run")
     _add_sql_args(p)
     p.add_argument("--fractions", help="Comma-separated, e.g. 0.01,0.03,0.1")
-    p.add_argument("--sample", choices=["largest", "all"], default="largest")
+    p.add_argument("--sample", choices=["largest", "all"], default="largest",
+                   help="largest: sample the first occurrence of the largest table, read everything else in full "
+                        "(default, unbiased for joins); all: sample every table and occurrence, each with its own "
+                        "seed (cheaper, rougher for joins)")
     p.add_argument("--method", choices=["auto", "system", "bernoulli"], default="auto")
     p.add_argument("--seed", type=int, default=42)
 
@@ -272,19 +321,56 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-rows", type=int)
     p.add_argument("--max-change", type=float, help="Max %% row-count change since the last check")
 
+    p = sub.add_parser("selftest", help="Check Gulliver itself: 'security' runs the bypass test set and the sandbox")
+    p.add_argument("suite", choices=["security"])
+    p.add_argument("--corpus", help="Another test set file (TOML, same format as the built-in one)")
+
+    p = sub.add_parser("spend", help="Money and bytes spent, by agent, day, table, session, task, connection or kind")
+    p.add_argument("--by", choices=["agent", "day", "table", "session", "task", "connection", "kind"], default="agent")
+    p.add_argument("--days", type=int, default=7, help="How many days back, today included (default 7)")
+    p.add_argument("--format", choices=["markdown", "csv"], default="markdown")
+
+    p = sub.add_parser("audit", help="Check the hash chain over the ledger, receipts and approvals")
+    p.add_argument("action", choices=["verify"])
+    p.add_argument("--head", help="A head hash printed by an earlier verify: prove nothing up to it changed")
+
+    p = sub.add_parser("top", help="Most expensive repeated queries, with priced same-rows fixes")
+    p.add_argument("--source", default="auto",
+                   help="auto, receipts, pg_stat_statements, bigquery_jobs, snowflake_history, csv:FILE or jsonl:FILE")
+    p.add_argument("--file", dest="path", help="CSV / JSONL / JSON export (columns: query, calls, bytes, ...)")
+    p.add_argument("--days", type=int, default=7, help="History window in days (default 7)")
+    p.add_argument("--limit", type=int, default=20, help="Query groups to list (default 20)")
+    p.add_argument("--analyze", type=int, default=10, help="Top groups to lint, fix and price (default 10)")
+    p.add_argument("--rank-by", choices=["auto", "cost", "runtime", "bytes", "calls"], default="auto")
+    p.add_argument("--dialect", default=None, help="Dialect of the SQL in a file (default: connection's)")
+
+    from .review import add_arguments as review_arguments
+
+    review_arguments(sub.add_parser("review", help="PR gate: lint, change type, downstream impact and cost of the "
+                                                   "SQL models a branch changes (exit code 2 = do not merge)"))
+
     p = sub.add_parser("tools", help="Print tool definitions for MCP, OpenAI or Gemini function calling")
     p.add_argument("--format", choices=["mcp", "openai", "gemini"], default="mcp")
+    p.add_argument("--toolset", default="all", help="all, core, pipeline, or a comma list of those and tool names")
 
     p = sub.add_parser("mcp", help="Start the MCP server (same as gulliver-mcp)")
     p.add_argument("--http", action="store_true")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--toolset", default="all", help="all, core, pipeline, or a comma list of those and tool names")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    from .identity import from_env, use
+
+    with use(from_env(args.agent, default_agent="cli", source="cli")):
+        return _main(parser, args)
+
+
+def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     try:
         if args.command == "demo":
             from .demo import build_demo
@@ -293,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "tools":
             from .mcp_server import export_tools
 
-            print(json.dumps(export_tools(args.format), indent=2))
+            print(json.dumps(export_tools(args.format, args.toolset), indent=2))
             return 0
         if args.command == "mcp":
             from .mcp_server import main as mcp_main
@@ -305,8 +391,28 @@ def main(argv: list[str] | None = None) -> int:
                 forwarded += ["--dsn", args.dsn]
             if args.http:
                 forwarded += ["--http", "--host", args.host, "--port", str(args.port)]
+            forwarded += ["--toolset", args.toolset]
             mcp_main(forwarded)
             return 0
+        if args.command == "rules":
+            from .lint_report import cli_rules
+
+            return cli_rules(args)
+        if args.command in ("lint", "fix"):
+            from . import lint_report
+
+            files_flags = args.command == "lint" and bool(
+                args.format not in (None, "text", "json") or args.fail_on or args.exclude or args.warn_unused_ignores
+                or args.metadata or args.output)
+            if args.command == "fix" and (args.check or args.write):
+                if not args.sql:
+                    raise ValueError("gulliver fix --check/--write needs .sql files or folders")
+                return lint_report.cli_fix(args)
+            if not args.file and lint_report.path_mode(args.sql, files_flags):
+                return lint_report.cli_lint(args) if args.command == "lint" else lint_report.cli_fix(args)
+            if len(args.sql or []) > 1:
+                raise ValueError("Give one SQL statement in quotes, or existing .sql files and folders")
+            args.sql = args.sql[0] if args.sql else None
         if args.command == "lint":
             dialect = args.dialect
             if dialect is None:
@@ -329,7 +435,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise
                 settings = None
             result = fix(settings, _read_sql(args), connection=args.connection, dialect=args.dialect,
-                        mode=args.mode, limit=args.limit)
+                        mode=args.mode, limit=args.limit, verify=args.verify, cases=args.cases, seed=args.seed,
+                        timezone=args.timezone)
             if result.get("changes"):
                 _write_output(args, result.get("fixed_sql"))
             return _emit(result, args.json)
@@ -341,6 +448,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "lineage":
                 return _emit(features.lineage_overview(args.models, args.manifest, dialect), args.json)
             return _emit(features.impact(args.target, args.models, args.manifest, dialect), args.json)
+        if args.command == "review":
+            from .review import cli as review_cli
+
+            return review_cli(args)
         if args.command == "translate" and not args.check:
             from . import features
 
@@ -350,6 +461,23 @@ def main(argv: list[str] | None = None) -> int:
 
         settings = load_settings(config_path=args.config, dsn=args.dsn)
         conn = args.connection
+        if args.command == "selftest":
+            from . import security
+
+            result = security.selftest(settings, conn, corpus=args.corpus)
+            if not args.json:
+                print(security.render_selftest(result))
+                return EXIT.get(str(result.get("status")), 1)
+            return _emit(result, args.json)
+        if args.command == "top":
+            from . import workload
+
+            result = workload.top(settings, source=args.source, connection=conn, days=args.days, limit=args.limit,
+                                  analyze=args.analyze, rank_by=args.rank_by, path=args.path, dialect=args.dialect)
+            if not args.json:
+                print(workload.render_text(result))
+                return EXIT.get(str(result.get("status")), 1)
+            return _emit(result, args.json)
         if args.command in ("snapshot", "drift", "translate", "diff", "incremental", "check"):
             from . import features
 
@@ -378,8 +506,23 @@ def main(argv: list[str] | None = None) -> int:
                                         ranges=args.ranges, fresh=args.fresh, min_rows=args.min_rows,
                                         max_change_pct=args.max_change)
             return _emit(result, args.json)
+        if args.command in ("spend", "audit"):
+            from . import runaway
+
+            if args.command == "audit":
+                return _emit(runaway.audit_verify(settings, head=args.head), args.json)
+            result = runaway.spend(settings, by=args.by, days=args.days)
+            if args.json or result["status"] != "ok":
+                return _emit(result, args.json)
+            print(runaway.render_spend(result, args.format), end="")
+            return 0
         if args.command == "status":
             result = core.status(settings)
+        elif args.command == "inspect" and (args.sensitive or args.scan):
+            from .guard import inspect_sensitive
+
+            result = inspect_sensitive(settings, connection=conn, table=args.table, limit=args.limit,
+                                       scan_rows=args.scan)
         elif args.command == "inspect":
             result = core.inspect(settings, connection=conn, table=args.table, limit=args.limit)
         elif args.command == "preflight":

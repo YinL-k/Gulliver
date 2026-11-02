@@ -8,22 +8,24 @@ The CLI and the MCP server are thin wrappers around these functions.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from . import __version__
+from . import __version__, guard
 from .config import ConfigError, Connection, Settings
 from .engines import Engine, EngineError, TableInfo, dialect_for, get_engine
-from .extrapolate import Fit, fit_power_law, overall_confidence
+from .extrapolate import BANDS, Fit, fit_power_law, overall_confidence
 from .lint import Finding, _has_aggregation, _outer_select, lint, summarize
-from .sampling import sample_query
-from .sqlsafety import Statement, classify
+from .sampling import sample_query, sampling_tree
+from .security import policy_for
+from .sqlsafety import Statement, base_tables, classify, table_ref
 from .store import Store
 
 DEFAULT_FRACTIONS = (0.01, 0.03, 0.1)
 SMALL_DATA_ROWS = 10_000
 SYSTEM_SAMPLING_ROWS = 1_000_000
+FEW_SAMPLED_ROWS = 2_000         # smallest rung reading fewer rows than this -> wider range
 REHEARSAL_RUNG_TIMEOUT_S = 300.0
 
 WORKFLOW = ("1 gulliver_inspect (what is big?)  2 gulliver_preflight (cost + lint)  "
@@ -85,6 +87,12 @@ def _store(settings: Settings) -> Store:
     return Store(settings.state_dir)
 
 
+def _runaway():
+    from . import runaway  # imported late: runaway uses helpers from this module
+
+    return runaway
+
+
 # -- status ----------------------------------------------------------------------------
 def status(settings: Settings) -> dict[str, Any]:
     spent = _store(settings).spent_today()
@@ -97,6 +105,7 @@ def status(settings: Settings) -> dict[str, Any]:
         "budget": budget.as_dict(),
         "spent_today": spent,
         "remaining_today_usd": round(max(0.0, budget.day_usd - spent["usd"]), 6),
+        "caller": _runaway().caller_status(settings),
         "workflow": WORKFLOW,
         "next_step": "Call gulliver_inspect to see which tables are big, then gulliver_preflight your SQL.",
     }
@@ -113,8 +122,10 @@ def inspect(settings: Settings, connection: str | None = None, table: str | None
                     return _error(f"Table not found or no metadata: {table}",
                                   "Call gulliver_inspect without a table to list what exists.",
                                   connection=conn.name)
+                table_dict = info.as_dict(with_columns=True)
+                guard.tag_columns(settings, conn, table_dict)
                 return {"status": "ok", "connection": conn.name, "engine": conn.engine,
-                        "table": info.as_dict(with_columns=True),
+                        "table": table_dict,
                         "next_step": "Write your SQL using only the columns you need, then call gulliver_preflight."}
             tables = engine.list_tables(limit=max(1, min(int(limit), 200)))
             return {"status": "ok", "connection": conn.name, "engine": conn.engine,
@@ -143,10 +154,10 @@ def lint_sql(sql: str, dialect: str = "duckdb") -> dict[str, Any]:
 
 def _attach_autofix(result: dict[str, Any], sql: str, dialect: str, table_info: dict[str, dict] | None) -> None:
     """When a result-preserving rewrite exists, hand the agent the fixed SQL right away (no extra call)."""
-    from .fixer import rewrite
+    from .verify import quick_rewrite
 
     try:
-        out = rewrite(sql, dialect, mode="safe", table_info=table_info)
+        out = quick_rewrite(sql, dialect, table_info)  # the rewrite, plus a short test on generated data
     except Exception:  # an autofix hint must never break preflight or lint
         return
     if not out.get("changes"):
@@ -154,6 +165,8 @@ def _attach_autofix(result: dict[str, Any], sql: str, dialect: str, table_info: 
     result["autofix"] = {"fixed_sql": out["fixed_sql"], "same_result": True,
                          "rules": sorted({c["rule"] for c in out["changes"]}),
                          "changes": out["changes"]}
+    if out.get("verify"):
+        result["autofix"]["verified"] = out["verify"]
     result["next_step"] = (result.get("next_step", "") + " autofix.fixed_sql returns exactly the same rows and avoids "
                            "the " + ", ".join(result["autofix"]["rules"]) + " problem; prefer it.").strip()
 
@@ -201,7 +214,7 @@ def _gate(settings: Settings, engine: Engine, estimate: Any, findings: list[Find
 def _preflight_core(settings: Settings, sql: str, connection: str | None) -> dict[str, Any]:
     conn = settings.connection(connection)
     dialect = dialect_for(conn.engine)
-    statement = classify(sql, dialect)
+    statement = classify(sql, dialect, policy_for(conn))
     base: dict[str, Any] = {
         "action": "preflight",
         "connection": conn.name,
@@ -212,13 +225,15 @@ def _preflight_core(settings: Settings, sql: str, connection: str | None) -> dic
     }
     if statement.kind == "block":
         base.update(status="block", gate={"status": "block", "blocks": [statement.reason]},
-                    next_step="Rewrite it as one SELECT (or CREATE/INSERT ... SELECT). " + statement.reason)
+                    next_step=statement.reason if statement.code else
+                    "Rewrite it as one SELECT (or CREATE/INSERT ... SELECT). " + statement.reason)
         return base
 
     store = _store(settings)
     with _engine(settings, connection) as (_, engine):
         infos, table_notes = _table_infos(engine, statement)
         findings = lint(statement.select, dialect, {k: v.as_dict() for k, v in infos.items()})
+        findings, shield = guard.check_query(settings, conn, statement, dialect, infos, findings)
         select_sql = statement.select.sql(dialect=dialect)
         try:
             estimate = engine.estimate(select_sql)
@@ -230,6 +245,8 @@ def _preflight_core(settings: Settings, sql: str, connection: str | None) -> dic
             return base
         spent = store.spent_today()["usd"]
         gate = _gate(settings, engine, estimate, findings, spent)
+        if shield["blocks"]:
+            gate.update(status="block", blocks=gate["blocks"] + shield["blocks"])
 
     if gate["status"] == "block":
         next_step = "Do not run this. Fix: " + "; ".join(gate["blocks"]) + "."
@@ -249,6 +266,8 @@ def _preflight_core(settings: Settings, sql: str, connection: str | None) -> dic
     )
     if table_notes:
         base["notes"] = table_notes
+    if shield["sensitive_columns"]:
+        base["sensitive_columns"] = shield["sensitive_columns"]
     if findings:
         _attach_autofix(base, sql, dialect, {k: v.as_dict(with_columns=True) for k, v in infos.items()})
     return base
@@ -273,22 +292,57 @@ def _choose_sample_tables(infos: dict[str, TableInfo], statement: Statement, mod
     return {ref}, largest_rows
 
 
+def _occurrence_seed(seed: int, occurrence: int) -> int:
+    """Each occurrence of a table gets its own seed. With one seed, two occurrences of a table hold the same
+    rows, every row meets itself in a self-join, and the small rungs come out too big (the fit then
+    underestimates the full run)."""
+    return seed + 7919 * occurrence
+
+
+def _lower_confidence(fit: Fit, to: str | None = None) -> None:
+    """Lower a fit's confidence one level (or to `to`) and widen its range to match."""
+    order = ["low", "medium", "high"]
+    if fit.value is None or fit.confidence not in order:
+        return
+    target = to or order[max(0, order.index(fit.confidence) - 1)]
+    if order.index(target) >= order.index(fit.confidence):
+        return
+    fit.confidence = target
+    lo, hi = BANDS[target]
+    fit.low, fit.high = fit.value * lo, fit.value * hi
+
+
+def _repeated_tables(statement: Statement, dialect: str, only: set[str] | None) -> dict[str, int]:
+    """Sampled tables that the query reads more than once (self-joins, IN/EXISTS on the same table,
+    a CTE used twice), with how often."""
+    counts: dict[str, int] = {}
+    for table in base_tables(sampling_tree(statement.select, dialect, only), dialect):
+        ref = table_ref(table, dialect)
+        if only is None or ref.lower() in only:
+            counts[ref] = counts.get(ref, 0) + 1
+    return {ref: n for ref, n in counts.items() if n > 1}
+
+
 def rehearse(settings: Settings, sql: str, connection: str | None = None,
              fractions: list[float] | None = None, sample: str = "largest", method: str = "auto",
-             seed: int = 42) -> dict[str, Any]:
+             seed: int = 42, progress: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
+    """`progress(done, total, message)` is called after each rung (the MCP server turns it into notifications)."""
     try:
-        return _rehearse(settings, sql, connection, fractions, sample, method, seed)
-    except (EngineError, ConfigError) as exc:
+        return _rehearse(settings, sql, connection, fractions, sample, method, seed, progress)
+    except ConfigError as exc:
         return _error(str(exc))
+    except EngineError as exc:
+        return _error(_scrubbed(settings, connection, sql, exc))
 
 
 def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: list[float] | None,
-              sample: str, method: str, seed: int) -> dict[str, Any]:
+              sample: str, method: str, seed: int,
+              progress: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
     budget = settings.budget
     store = _store(settings)
     conn = settings.connection(connection)
     dialect = dialect_for(conn.engine)
-    statement = classify(sql, dialect)
+    statement = classify(sql, dialect, policy_for(conn))
     result: dict[str, Any] = {
         "action": "rehearse", "connection": conn.name, "engine": conn.engine, "sql": sql.strip(),
         "sql_hash": statement.sql_hash, "statement": statement.public(),
@@ -305,6 +359,11 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
     with _engine(settings, connection) as (_, engine):
         infos, table_notes = _table_infos(engine, statement)
         findings = lint(statement.select, dialect, {k: v.as_dict() for k, v in infos.items()})
+        findings, shield = guard.check_query(settings, conn, statement, dialect, infos, findings)
+        if shield["blocks"]:
+            result.update(status="block", lint=[f.as_dict() for f in findings], reasons=shield["blocks"],
+                          next_step="Do not rehearse this. Fix: " + "; ".join(shield["blocks"]) + ".")
+            return result
         select_sql = statement.select.sql(dialect=dialect)
         full_estimate = engine.estimate(select_sql)
         only, largest_rows = _choose_sample_tables(infos, statement, sample)
@@ -317,13 +376,28 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
             return result
 
         methods = engine.supported_methods()
+        repeated = _repeated_tables(statement, dialect, only)
         if method == "auto":
-            chosen = "system" if ("bernoulli" not in methods or (largest_rows or 0) >= SYSTEM_SAMPLING_ROWS) else "bernoulli"
+            # Block (system) samples are cheap but lumpy, and two lumpy samples of one table make a join
+            # very noisy. A table read more than once is read in full anyway (or sampled twice), so take
+            # the row-level sample there.
+            # On local DuckDB a row-level sample costs only a local scan, and DuckDB's vector-sized system
+            # samples were measured to miss the range on plain scans and key joins, so take bernoulli there.
+            big = (largest_rows or 0) >= SYSTEM_SAMPLING_ROWS and engine.name != "duckdb"
+            chosen = "system" if ("bernoulli" not in methods or (big and not repeated)) else "bernoulli"
         elif method in methods:
             chosen = method
         else:
             return _error(f"method '{method}' is not supported by {engine.name}; use one of {', '.join(methods)}")
 
+        result["receipt_id"] = store.new_id("rehearse")
+        loop_guard = _runaway().check(settings, engine, sql, connection=conn.name, sql_hash=statement.sql_hash,
+                                 kind="rehearsal", cost=None, bytes_=None, receipt_id=result["receipt_id"],
+                                 repeats=False)
+        if loop_guard["status"] != "ok":
+            result.update(status=loop_guard["status"], next_step=loop_guard["next_step"], **loop_guard["extra"])
+            store.save_receipt(result)
+            return result
         baseline = engine.baseline_latency()
         rungs: list[dict[str, Any]] = []
         stopped: str | None = None
@@ -332,14 +406,17 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
 
         for fraction in fracs:
             sampled_sql, sampled_tables = sample_query(
-                statement.select, dialect, lambda ref, f=fraction: engine.sample_clause(f, seed, chosen), only)
+                statement.select, dialect,
+                lambda ref, occ, f=fraction: engine.sample_clause(f, _occurrence_seed(seed, occ), chosen),
+                only, first_only=(sample == "largest"))
             rung_cost = None
             if engine.billed:
                 try:
                     rung_est = engine.estimate(sampled_sql)
                     rung_cost = rung_est.cost_usd
                 except EngineError as exc:
-                    stopped = f"the engine rejected the sampled query at {fraction:.0%}: {exc}"
+                    stopped = (f"the engine rejected the sampled query at {fraction:.0%}: "
+                               f"{guard.scrub_error(settings, conn, sql, dialect, str(exc))}")
                     break
             if rung_cost is None and len(rungs) >= 2:
                 fit = fit_power_law("runtime_s", [r["fraction"] for r in rungs],
@@ -361,15 +438,18 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
                                      timeout_s=min(budget.max_runtime_s, REHEARSAL_RUNG_TIMEOUT_S),
                                      max_bytes_billed=cap)
             except EngineError as exc:
-                stopped = f"the {fraction:.0%} rung failed: {exc}"
+                stopped = f"the {fraction:.0%} rung failed: {guard.scrub_error(settings, conn, sql, dialect, str(exc))}"
                 break
             cost = res.cost_usd if res.cost_usd is not None else engine.cost_for(res.bytes_processed, res.elapsed_s)
             spent += cost or 0.0
             store.record_spend({"kind": "rehearsal", "connection": conn.name, "engine": conn.engine,
                                 "sql_hash": statement.sql_hash, "fraction": fraction,
-                                "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4)})
+                                "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4),
+                                **loop_guard["ledger"]})
             rungs.append({"fraction": fraction, "elapsed_s": round(res.elapsed_s, 4), "output_rows": res.rows,
                           "bytes": res.bytes_processed, "cost_usd": cost, "sampled_tables": sampled_tables})
+            if progress is not None:
+                progress(len(rungs), len(fracs), f"{fraction:.0%} sample: {res.rows:,} rows in {res.elapsed_s:.2f}s")
 
     if not rungs:
         result.update(status="error", error=f"No rung could run: {stopped}", lint=[f.as_dict() for f in findings],
@@ -413,6 +493,7 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
     # (saturate) as the data grows. A power law misses that; cap it with what we observed and the planner.
     rows_fit = by_name["output_rows"]
     outer = _outer_select(statement.select)
+    capped = False
     if outer is not None and _has_aggregation(outer) and rows_fit.value is not None:
         observed = max(r["output_rows"] for r in rungs)
         cap = max(observed, full_estimate.rows or 0)
@@ -420,8 +501,32 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
             rows_fit.value = float(cap)
             rows_fit.low = float(observed)
             rows_fit.high = float(cap) * 2
+            capped = True
             rows_fit.notes.append("Grouped result: group counts saturate, so the prediction is capped by the "
                                   "largest rung and the planner estimate.")
+
+    if repeated:
+        listed = ", ".join(f"{ref} ({n}x)" for ref, n in repeated.items())
+        if sample == "largest":
+            rows_fit.notes.append(f"Read more than once: {listed}. Only the first occurrence is sampled; the others "
+                                  "are read in full on every rung, so the output grows ~linearly and stays unbiased.")
+        else:
+            # Each side is sampled independently, so a join between them grows with fraction^2: the sampling
+            # noise of both sides multiplies, and the fit extrapolates 100x from the 10% rung instead of 10x.
+            rows_fit.notes.append(f"Read more than once: {listed}. Every occurrence is sampled with its own seed, "
+                                  "so a join between them grows with fraction^2 (exponent ~2) and the noise of both "
+                                  "samples multiplies; the default --sample largest gives a tighter range.")
+            for fit in (rows_fit, runtime_fit):
+                _lower_confidence(fit, "low")
+
+    sampled_rows = (largest_rows or 0) * rungs[0]["fraction"]
+    # flat or capped (grouped) results need few rows; growing ones do not
+    flat = capped or (rows_fit.exponent is not None and rows_fit.exponent < 0.3)
+    if largest_rows and sampled_rows < FEW_SAMPLED_ROWS and not flat:
+        rows_fit.notes.append(f"The smallest rung read only about {sampled_rows:,.0f} rows of the sampled table; "
+                              "with so few rows a skewed key makes the curve noisy, so the range is wider.")
+        for fit in (rows_fit, runtime_fit):
+            _lower_confidence(fit)
 
     predictions = {f.metric: f.as_dict() for f in fits}
     # money: exact dry-run bytes beat extrapolated bytes; otherwise use the engine's cost model
@@ -454,6 +559,10 @@ def _rehearse(settings: Settings, sql: str, connection: str | None, fractions: l
     if stopped:
         warn.append("ladder stopped early: " + stopped)
     out_rows = by_name["output_rows"].value
+    if out_rows and largest_rows and out_rows > 2 * largest_rows:
+        warn.append(f"the query multiplies rows: about {out_rows:,.0f} output rows from at most {largest_rows:,} "
+                    f"input rows per table ({out_rows / largest_rows:,.0f}x). Check the join keys: a join on a "
+                    "non-unique key matches every pair.")
     if out_rows and out_rows > budget.max_output_rows:
         warn.append(f"the full result has about {out_rows:,.0f} rows; only {budget.max_output_rows} come back as a "
                     "preview. Aggregate if you need all of it.")
@@ -490,8 +599,19 @@ def run(settings: Settings, sql: str, connection: str | None = None, max_rows: i
         allow_write: bool = False) -> dict[str, Any]:
     try:
         return _run(settings, sql, connection, max_rows, allow_write)
-    except (EngineError, ConfigError) as exc:
+    except ConfigError as exc:
         return _error(str(exc))
+    except EngineError as exc:
+        return _error(_scrubbed(settings, connection, sql, exc))
+
+
+def _scrubbed(settings: Settings, connection: str | None, sql: str, exc: Exception) -> str:
+    """An engine error with data values removed (see guard.scrub_error)."""
+    try:
+        conn = settings.connection(connection)
+    except ConfigError:
+        return str(exc)
+    return guard.scrub_error(settings, conn, sql, dialect_for(conn.engine), str(exc))
 
 
 def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | None,
@@ -546,7 +666,7 @@ def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | N
     if cost_for_gate is not None and spent + cost_for_gate > budget.day_usd:
         return finish("block", f"Today's budget would be exceeded (spent {_fmt_usd(spent)}, limit {_fmt_usd(budget.day_usd)}).")
     if cost_for_gate is not None and cost_for_gate > budget.approval_over_usd:
-        approval = store.find_approval(pre["sql_hash"], conn.name)
+        approval = store.find_approval(pre["sql_hash"], conn.name, cost=cost_for_gate)
         if approval is None:
             rid = store.new_id("run")
             pre["receipt_id"] = rid
@@ -558,17 +678,25 @@ def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | N
 
     preview_rows = max(0, min(int(max_rows) if max_rows is not None else budget.max_output_rows, budget.max_output_rows))
     write = statement_kind == "write"
+    pre.setdefault("receipt_id", store.new_id("run"))  # known before the run, so the query can carry it as a tag
     with _engine(settings, connection, read_only=not write) as (_, engine):
+        loop_guard = _runaway().check(settings, engine, sql, connection=conn.name, sql_hash=pre["sql_hash"], kind="run",
+                                 cost=cost_for_gate, bytes_=estimate.get("bytes"), receipt_id=pre["receipt_id"])
+        if loop_guard["status"] != "ok":
+            return finish(loop_guard["status"], loop_guard["next_step"], **loop_guard["extra"])
+        pre.update(loop_guard["extra"])
         cap = engine.max_bytes_for_cost(budget.max_query_usd)
         try:
             res = engine.execute(sql.strip().rstrip(";") if write else pre["sql"].rstrip(";"),
                                  preview_rows=preview_rows, timeout_s=budget.max_runtime_s, max_bytes_billed=cap)
         except EngineError as exc:
+            # engines quote the value that failed: scrub it like a preview before the agent or the receipt sees it
             return finish("error", "The run failed (nothing was returned). Read the error, fix the SQL, preflight again.",
-                          error=str(exc))
+                          error=guard.scrub_error(settings, conn, sql, dialect_for(conn.engine), str(exc)))
         cost = res.cost_usd if res.cost_usd is not None else engine.cost_for(res.bytes_processed, res.elapsed_s)
     store.record_spend({"kind": "run", "connection": conn.name, "engine": conn.engine, "sql_hash": pre["sql_hash"],
-                        "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4)})
+                        "cost_usd": cost, "bytes": res.bytes_processed, "elapsed_s": round(res.elapsed_s, 4),
+                        **loop_guard["ledger"]})
 
     actual = {"runtime_s": round(res.elapsed_s, 4), "rows": res.rows, "bytes": res.bytes_processed,
               "cost_usd": round(cost, 6) if cost is not None else None}
@@ -581,8 +709,13 @@ def _run(settings: Settings, sql: str, connection: str | None, max_rows: int | N
             if p is not None and a is not None:
                 comparison[key] = {"predicted": p, "actual": a,
                                    "ratio": round(a / p, 3) if p else None}
-    result = finish("ok", "Done. Show the human the receipt (gulliver_receipt) if they want proof.",
-                    actual=actual, columns=res.columns, preview=res.preview, truncated=res.truncated)
+    # the result guard masks, flags and trims the preview before the agent or the receipt sees it
+    guarded = guard.guard_preview(settings, conn, res.columns, res.preview, pre)
+    result = finish("warn" if guarded.get("data_warnings") else "ok",
+                    guard.run_next_step(guarded, "Done. Show the human the receipt (gulliver_receipt) if they want "
+                                                 "proof."),
+                    actual=actual, truncated=(res.truncated or len(guarded["preview"]) < len(res.preview)
+                                              or bool(guarded.get("truncated_by"))), **guarded)
     if comparison:
         result["predicted_vs_actual"] = comparison
         store.save_receipt(result)

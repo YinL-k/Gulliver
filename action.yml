@@ -1,0 +1,242 @@
+name: Gulliver review
+description: >-
+  PR gate for SQL models: new scale lint, breaking changes, downstream impact, and the scan and money per run
+  and per month before vs after. Posts one sticky PR comment and fails the job when the review policy says block.
+author: laaielichter
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  models:
+    description: Folder with the SQL models (*.sql, dbt-style refs allowed), relative to the repository root.
+    required: false
+    default: models
+  base:
+    description: Base ref to compare against. Empty means origin/<the pull request's base branch>.
+    required: false
+    default: ""
+  head:
+    description: Head ref. Only committed changes are reviewed.
+    required: false
+    default: HEAD
+  manifest-base:
+    description: dbt manifest.json of the base (production) build. Use with manifest-head instead of git.
+    required: false
+    default: ""
+  manifest-head:
+    description: dbt manifest.json of the branch (from dbt compile).
+    required: false
+    default: ""
+  dsn:
+    description: >-
+      Connection string for cost estimates, e.g. bigquery://my-project. Credentials come from the job's
+      environment (never put them here). Empty means no cost estimates unless gulliver.toml has a connection.
+    required: false
+    default: ""
+  connection:
+    description: Connection name from gulliver.toml.
+    required: false
+    default: ""
+  config:
+    description: Path to gulliver.toml (its [review] section is the policy).
+    required: false
+    default: ""
+  rehearse:
+    description: Also run each changed model on 1% and 3% samples to catch new row explosions (costs money on billed engines).
+    required: false
+    default: "false"
+  fail-on:
+    description: Override the policy's fail_on (comma-separated, or "none").
+    required: false
+    default: ""
+  comment:
+    description: Post or update one PR comment with the report.
+    required: false
+    default: "true"
+  sarif:
+    description: Also upload `gulliver lint --format sarif` results to code scanning (needs security-events write).
+    required: false
+    default: "false"
+  fail:
+    description: Fail the job when the review status is block or error.
+    required: false
+    default: "true"
+  extras:
+    description: Optional engine extras to install, e.g. "bigquery" or "postgres,snowflake".
+    required: false
+    default: ""
+  package:
+    description: pip requirement to install instead of this action's own source, e.g. "gulliver-mcp==0.3.0".
+    required: false
+    default: ""
+  python-version:
+    description: Python version for setup-python. Empty skips setup-python (use the runner's python).
+    required: false
+    default: "3.12"
+  github-token:
+    description: Token used to post the PR comment.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  status:
+    description: ok, warn, block or error.
+    value: ${{ steps.review.outputs.status }}
+  exit-code:
+    description: The exit code of gulliver review (0 ok/warn, 1 error, 2 block).
+    value: ${{ steps.review.outputs.exit-code }}
+  report:
+    description: Path of the markdown report.
+    value: ${{ steps.review.outputs.report }}
+  json:
+    description: Path of the JSON report.
+    value: ${{ steps.review.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      if: inputs.python-version != ''
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install Gulliver
+      shell: bash
+      env:
+        GV_PACKAGE: ${{ inputs.package }}
+        GV_EXTRAS: ${{ inputs.extras }}
+      run: |
+        if [ -n "$GV_PACKAGE" ]; then
+          spec="$GV_PACKAGE"
+        elif [ -n "$GV_EXTRAS" ]; then
+          spec="${GITHUB_ACTION_PATH}[${GV_EXTRAS}]"
+        else
+          spec="$GITHUB_ACTION_PATH"
+        fi
+        python -m pip install --disable-pip-version-check --quiet "$spec"
+        gulliver --version
+
+    - name: Make the base ref available
+      if: inputs.manifest-base == '' && inputs.manifest-head == ''
+      shell: bash
+      env:
+        GV_BASE: ${{ inputs.base }}
+      run: |
+        base="${GV_BASE:-origin/${GITHUB_BASE_REF:-main}}"
+        if ! git rev-parse --verify --quiet "${base}^{commit}" > /dev/null; then
+          branch="${base#origin/}"
+          git fetch --no-tags --quiet origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" \
+            || echo "::warning::Could not fetch ${base}. Use actions/checkout with fetch-depth: 0."
+        fi
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          git fetch --no-tags --quiet --unshallow origin \
+            || echo "::warning::Shallow clone. Use actions/checkout with fetch-depth: 0."
+        fi
+
+    - name: Review
+      id: review
+      shell: bash
+      env:
+        GV_MODELS: ${{ inputs.models }}
+        GV_BASE: ${{ inputs.base }}
+        GV_HEAD: ${{ inputs.head }}
+        GV_MANIFEST_BASE: ${{ inputs.manifest-base }}
+        GV_MANIFEST_HEAD: ${{ inputs.manifest-head }}
+        GV_DSN: ${{ inputs.dsn }}
+        GV_CONNECTION: ${{ inputs.connection }}
+        GV_CONFIG: ${{ inputs.config }}
+        GV_REHEARSE: ${{ inputs.rehearse }}
+        GV_FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        set +e
+        md="$RUNNER_TEMP/gulliver-review.md"
+        js="$RUNNER_TEMP/gulliver-review.json"
+        args=(review --head "$GV_HEAD" -o "$md" --json)
+        if [ -n "$GV_MANIFEST_BASE$GV_MANIFEST_HEAD" ]; then
+          args+=(--manifest-base "$GV_MANIFEST_BASE" --manifest-head "$GV_MANIFEST_HEAD")
+        else
+          args+=(--models "$GV_MODELS" --base "${GV_BASE:-origin/${GITHUB_BASE_REF:-main}}")
+        fi
+        if [ -n "$GV_DSN" ]; then args+=(--dsn "$GV_DSN"); fi
+        if [ -n "$GV_CONNECTION" ]; then args+=(--connection "$GV_CONNECTION"); fi
+        if [ -n "$GV_CONFIG" ]; then args+=(--config "$GV_CONFIG"); fi
+        if [ "$GV_REHEARSE" = "true" ]; then args+=(--rehearse); fi
+        if [ -n "$GV_FAIL_ON" ]; then args+=(--fail-on "$GV_FAIL_ON"); fi
+        gulliver "${args[@]}" > "$js"
+        code=$?
+        if [ ! -s "$md" ]; then
+          printf '<!-- gulliver-review -->\n## Gulliver review: ERROR\n\nThe review did not finish; see the job log.\n' > "$md"
+        fi
+        status=$(python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status", "error"))' "$js" 2> /dev/null || echo error)
+        cat "$md" >> "$GITHUB_STEP_SUMMARY"
+        {
+          echo "status=$status"
+          echo "exit-code=$code"
+          echo "report=$md"
+          echo "json=$js"
+        } >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - name: Post or update the PR comment
+      if: inputs.comment == 'true' && github.event.pull_request.number
+      continue-on-error: true  # fork PRs get a read-only token
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GV_PR: ${{ github.event.pull_request.number }}
+        GV_REPORT: ${{ steps.review.outputs.report }}
+      run: |
+        marker='<!-- gulliver-review -->'
+        # Only our own comment: written by this token's user and starting with the marker. Anyone can paste
+        # the marker into a comment; that one must not be overwritten or left as the "current" report.
+        # GITHUB_TOKEN cannot read /user; its comments are written by github-actions[bot].
+        login=$(gh api user --jq .login 2> /dev/null) || login=''
+        if [ -z "$login" ] || [ "$login" = "null" ]; then login='github-actions[bot]'; fi
+        id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${GV_PR}/comments" --paginate \
+          --jq ".[] | select(.user.login == \"${login}\" and (.body | startswith(\"${marker}\"))) | .id" \
+          | head -n 1)
+        if [ -n "$id" ]; then
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -F "body=@${GV_REPORT}" > /dev/null
+        else
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${GV_PR}/comments" -F "body=@${GV_REPORT}" > /dev/null
+        fi
+
+    - name: Lint models to SARIF
+      id: sarif
+      if: inputs.sarif == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        GV_MODELS: ${{ inputs.models }}
+        GV_CONFIG: ${{ inputs.config }}
+      run: |
+        out="$RUNNER_TEMP/gulliver.sarif"
+        args=(lint --format sarif "$GV_MODELS")
+        if [ -n "$GV_CONFIG" ]; then args+=(--config "$GV_CONFIG"); fi
+        gulliver "${args[@]}" > "$out" || true
+        if ! python -c 'import json,sys; assert json.load(open(sys.argv[1]))["runs"]' "$out" 2> /dev/null; then
+          echo "::warning::This Gulliver version cannot write SARIF for a folder (gulliver lint --format sarif)."
+          exit 1
+        fi
+        echo "file=$out" >> "$GITHUB_OUTPUT"
+
+    - name: Upload SARIF
+      if: inputs.sarif == 'true' && steps.sarif.outcome == 'success'
+      uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      with:
+        sarif_file: ${{ steps.sarif.outputs.file }}
+        category: gulliver
+
+    - name: Gate
+      if: inputs.fail == 'true'
+      shell: bash
+      env:
+        GV_CODE: ${{ steps.review.outputs.exit-code }}
+        GV_STATUS: ${{ steps.review.outputs.status }}
+      run: |
+        if [ "$GV_CODE" != "0" ]; then
+          echo "::error title=Gulliver review::status ${GV_STATUS}. See the PR comment or the job summary."
+          exit "$GV_CODE"
+        fi

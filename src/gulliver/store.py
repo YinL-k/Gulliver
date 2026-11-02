@@ -3,7 +3,9 @@
 Everything is plain JSON so people (and other tools) can read it.
   receipts/<id>.json    one per preflight, rehearsal and run
   ledger.jsonl          money and bytes actually spent, one line per execution
-  approvals/<id>.json   written only by `gulliver approve <id>` (a human action)
+  approvals/<id>.json   written by `gulliver approve <id>`, or by the MCP server when the human approves in
+                        the client (only with [approval] channel = "elicitation")
+  audit.jsonl           hash chain over receipt and approval files (see audit.py, `gulliver audit verify`)
 """
 
 from __future__ import annotations
@@ -29,6 +31,13 @@ def iso(dt: datetime) -> str:
 
 def parse_iso(text: str) -> datetime:
     return datetime.fromisoformat(text)
+
+
+def _mtime(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
 
 
 class Store:
@@ -57,32 +66,43 @@ class Store:
 
     # -- receipts ------------------------------------------------------------------
     def new_id(self, action: str) -> str:
-        return f"gv-{now_utc().strftime('%Y%m%d-%H%M%S')}-{action[:3]}-{secrets.token_hex(2)}"
+        # 32 random bits: parallel writers (several MCP sessions, diff/check internals) must not share an id
+        return f"gv-{now_utc().strftime('%Y%m%d-%H%M%S')}-{action[:3]}-{secrets.token_hex(4)}"
 
     def save_receipt(self, receipt: dict[str, Any]) -> str:
         self._ensure()
         rid = receipt.setdefault("receipt_id", self.new_id(receipt.get("action", "rec")))
         receipt.setdefault("created_at", iso(now_utc()))
         path = self.receipts_dir / f"{rid}.json"
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(receipt, indent=2, default=str))
+        tmp = path.with_name(f"{rid}.{secrets.token_hex(4)}.tmp")   # unique, so writers never share a tmp file
+        data = json.dumps(receipt, indent=2, default=str).encode("utf-8")
+        tmp.write_bytes(data)   # bytes, so the file is exactly what is hashed (text mode writes \r\n on Windows)
         os.replace(tmp, path)
+        self._audit("receipt", rid, data)
         return rid
+
+    def _audit(self, kind: str, item_id: str, data: bytes) -> None:
+        from .audit import append, content_hash
+
+        append(self.root / "audit.jsonl", {"at": iso(now_utc()), "kind": kind, "id": item_id,
+                                           "sha256": content_hash(data)})
 
     def load_receipt(self, receipt_id: str) -> dict[str, Any] | None:
         safe = Path(receipt_id).name
         path = self.receipts_dir / f"{safe}.json"
         if not path.is_file():
             return None
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def receipts(self) -> list[dict[str, Any]]:
         if not self.receipts_dir.is_dir():
             return []
         out = []
-        for path in sorted(self.receipts_dir.glob("*.json"), reverse=True):
+        # newest first; ids only have one-second resolution, so ties are broken by the file's write time
+        paths = sorted(self.receipts_dir.glob("*.json"), key=lambda p: (p.name[:18], _mtime(p), p.name), reverse=True)
+        for path in paths:
             try:
-                out.append(json.loads(path.read_text()))
+                out.append(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, json.JSONDecodeError):
                 continue
         return out
@@ -97,7 +117,8 @@ class Store:
         return None
 
     # -- approvals -----------------------------------------------------------------
-    def approve(self, receipt_id: str, note: str = "") -> dict[str, Any]:
+    def approve(self, receipt_id: str, note: str = "", channel: str = "cli",
+                client: str | None = None) -> dict[str, Any]:
         receipt = self.load_receipt(receipt_id)
         if receipt is None:
             raise FileNotFoundError(f"No receipt {receipt_id}")
@@ -110,30 +131,74 @@ class Store:
             "expires_at": iso(now_utc() + APPROVAL_TTL),
             "max_cost_usd": receipt.get("gate", {}).get("cost_for_gate_usd"),
             "note": note,
+            "channel": channel,   # cli: `gulliver approve`; elicitation: the human answered in the MCP client
         }
-        (self.approvals_dir / f"{Path(receipt_id).name}.json").write_text(json.dumps(approval, indent=2))
+        if client:
+            approval["client"] = client
+        data = json.dumps(approval, indent=2).encode("utf-8")
+        (self.approvals_dir / f"{Path(receipt_id).name}.json").write_bytes(data)
+        self._audit("approval", Path(receipt_id).name, data)
         return approval
 
-    def find_approval(self, sql_hash: str, connection: str) -> dict[str, Any] | None:
+    def _audited(self) -> dict[tuple[str, str], str]:
+        """(kind, id) -> sha256 of the file as Gulliver wrote it, from audit.jsonl. With GULLIVER_AUDIT_KEY set,
+        only lines whose HMAC checks out count."""
+        from .audit import HMAC, _key, entry_hash
+
+        path = self.root / "audit.jsonl"
+        out: dict[tuple[str, str], str] = {}
+        if not path.is_file():
+            return out
+        keyed = _key() is not None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+                if keyed and (entry.get("alg") != HMAC or entry_hash(entry) != entry.get("hash")):
+                    continue
+                out[(entry["kind"], entry["id"])] = entry["sha256"]
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+        return out
+
+    def find_approval(self, sql_hash: str, connection: str, cost: float | None = None) -> dict[str, Any] | None:
+        """A live human approval for this query. Only approvals Gulliver wrote count (the file must match its
+        audit entry, so one written by hand is ignored). With `cost`, only an approval given for at least that
+        cost counts: approving a rehearsal or a velocity request does not approve the full run's cost."""
         if not self.approvals_dir.is_dir():
             return None
+        from .audit import content_hash
+
+        audited: dict[tuple[str, str], str] | None = None
         now = now_utc()
         for path in sorted(self.approvals_dir.glob("*.json"), reverse=True):
             try:
-                data = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
+                raw = path.read_bytes()
+                data = json.loads(raw)
+                live = (data.get("sql_hash") == sql_hash and data.get("connection") == connection
+                        and parse_iso(data["expires_at"]) > now)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 continue
-            if (data.get("sql_hash") == sql_hash and data.get("connection") == connection
-                    and parse_iso(data["expires_at"]) > now):
-                return data
+            if not live:
+                continue
+            if cost is not None:
+                approved = data.get("max_cost_usd")
+                if not isinstance(approved, (int, float)) or approved < cost - 1e-9:
+                    continue
+            if audited is None:
+                audited = self._audited()
+            if audited.get(("approval", path.stem)) != content_hash(raw):
+                continue
+            return data
         return None
 
     # -- ledger --------------------------------------------------------------------
     def record_spend(self, entry: dict[str, Any]) -> None:
+        """Append one hash-chained line, stamped with who asked (agent, session, task)."""
+        from .audit import append
+        from .identity import current
+
         self._ensure()
-        entry = {"at": iso(now_utc()), **entry}
-        with self.ledger_path.open("a") as fh:
-            fh.write(json.dumps(entry, default=str) + "\n")
+        append(self.ledger_path, {"at": iso(now_utc()), **current().fields(), **entry})
 
     def spent_today(self) -> dict[str, float]:
         today = now_utc().date()
@@ -141,7 +206,7 @@ class Store:
         runs = 0
         bytes_total = 0
         if self.ledger_path.is_file():
-            for line in self.ledger_path.read_text().splitlines():
+            for line in self.ledger_path.read_text(encoding="utf-8").splitlines():
                 try:
                     entry = json.loads(line)
                     if parse_iso(entry["at"]).date() != today:

@@ -7,6 +7,9 @@ Gulliver is read-first. It understands three kinds of statements:
          rehearsed (rehearsals never write); a real run needs allow_write=True
   block  everything else (DELETE, UPDATE, DROP, TRUNCATE, ALTER, MERGE, GRANT, several
          statements at once, unparsable SQL)               -> refused
+
+A read or write that calls a side-effect function, runs SQL hidden in a string, or reads a file or URL outside
+the allowed folders is also refused, with a code GS001-GS004 (see security.py).
 """
 
 from __future__ import annotations
@@ -16,9 +19,15 @@ from dataclasses import dataclass, field
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ParseError
+from sqlglot.errors import SqlglotError
+
+from .security import SecurityPolicy
+from .security import check as security_check
 
 READ_ROOTS = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)
+# Statements that change data or schema. Inside another statement (a CTE such as WITH d AS (DELETE ... RETURNING *))
+# they would run as a side effect of a read or of an INSERT/CREATE ... SELECT, so they are refused there.
+DATA_CHANGING = (exp.Insert, exp.Delete, exp.Update, exp.Create, exp.Drop, exp.Merge)
 
 
 @dataclass
@@ -31,15 +40,20 @@ class Statement:
     select: exp.Expression | None = None   # the read part (for write statements too)
     target: str | None = None              # write target table
     tables: list[str] = field(default_factory=list)
+    code: str = ""                         # GS001-GS004 when a security rule refused it
 
     @property
     def sql_hash(self) -> str:
-        return sql_fingerprint(self.select.sql(dialect=self.dialect) if self.select is not None else self.sql)
+        # comments are dropped: the same query with "-- retry 2" is the same query (loop guard, approvals)
+        return sql_fingerprint(self.select.sql(dialect=self.dialect, comments=False)
+                               if self.select is not None else self.sql)
 
     def public(self) -> dict:
         out = {"kind": self.kind, "tables": self.tables}
         if self.reason:
             out["reason"] = self.reason
+        if self.code:
+            out["code"] = self.code
         if self.target:
             out["write_target"] = self.target
         return out
@@ -79,22 +93,36 @@ def table_ref(table: exp.Table, dialect: str) -> str:
     return bare.sql(dialect=dialect)
 
 
-def classify(sql: str, dialect: str = "duckdb") -> Statement:
+def classify(sql: str, dialect: str = "duckdb", policy: SecurityPolicy | None = None) -> Statement:
+    """What the statement is and whether it may run. `policy` comes from the connection
+    (security.policy_for); without it, path allowlists cannot be checked (offline lint)."""
+    statement = _classify(sql, dialect)
+    if statement.kind != "block" and statement.tree is not None:
+        hit = security_check(statement.tree, dialect, policy, statement.kind)
+        if hit is not None:
+            return Statement(sql, dialect, "block", reason=f"{hit.label}: {hit.reason}", tree=statement.tree,
+                             tables=statement.tables, code=hit.code)
+    return statement
+
+
+def _classify(sql: str, dialect: str) -> Statement:
     text = _strip_trailing(sql)
     if not text:
         return Statement(sql, dialect, "block", reason="Empty SQL.")
     try:
         trees = [t for t in sqlglot.parse(text, read=dialect) if t is not None]
-    except ParseError as exc:
+    except SqlglotError as exc:   # ParseError and TokenError (e.g. Postgres `IN ($1,$2)`, an open quote)
         first = str(exc).splitlines()[0] if str(exc) else "parse error"
         return Statement(sql, dialect, "block", reason=f"Could not parse SQL for dialect '{dialect}': {first}")
     if len(trees) != 1:
         return Statement(sql, dialect, "block", reason="Send exactly one statement at a time.")
     tree = trees[0]
 
+    if isinstance(tree, (*READ_ROOTS, exp.Create, exp.Insert)) and any(
+            isinstance(node, DATA_CHANGING) for node in tree.walk() if node is not tree):
+        return Statement(sql, dialect, "block", reason="Data-changing statement nested inside a query.", tree=tree)
+
     if isinstance(tree, READ_ROOTS):
-        if any(isinstance(node, (exp.Insert, exp.Delete, exp.Update, exp.Create, exp.Drop)) for node in tree.walk()):
-            return Statement(sql, dialect, "block", reason="Data-changing statement nested inside a query.", tree=tree)
         if any(isinstance(node, exp.Select) and node.args.get("into") for node in tree.walk()):
             return Statement(sql, dialect, "block", reason="SELECT ... INTO writes a table; use CREATE TABLE ... AS SELECT.",
                              tree=tree)

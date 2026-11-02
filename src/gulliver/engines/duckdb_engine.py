@@ -12,7 +12,7 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
-from ..config import Connection
+from ..config import ConfigError, Connection
 from .base import HEURISTIC, Engine, EngineError, Estimate, ExecResult, TableInfo
 
 TYPE_BYTES = {
@@ -60,7 +60,17 @@ class DuckDBEngine(Engine):
             raise EngineError(f"Could not open DuckDB database {path}: {exc}") from exc
         threads = self.params.get("threads")
         if threads:
-            self.con.execute(f"SET threads = {int(threads)}")
+            try:
+                self.con.execute(f"SET threads = {int(threads)}")
+            except duckdb.Error:  # already set and locked by an earlier connection to the same file
+                pass
+        from ..security import sandbox_duckdb
+
+        try:  # file and network access limited to allowed_paths, then the settings are locked
+            self.sandbox = sandbox_duckdb(self.con, connection)
+        except (duckdb.Error, ConfigError) as exc:
+            self.con.close()
+            raise EngineError(f"Could not sandbox DuckDB database {path}: {_clean_error(exc)}") from exc
 
     def close(self) -> None:
         try:
@@ -126,12 +136,43 @@ class DuckDBEngine(Engine):
         info.name = ref
         return info
 
+    def view_sources(self, ref: str) -> list[str] | None:
+        """The tables a view reads (from its definition), or None when ref is not a view."""
+        try:
+            node = sqlglot.parse_one(f"SELECT * FROM {ref}", read="duckdb").find(exp.Table)
+        except sqlglot.errors.ParseError:
+            return None
+        if node is None or not isinstance(node.this, exp.Identifier):
+            return None
+        query = "SELECT sql FROM duckdb_views() WHERE NOT internal AND lower(view_name) = lower(?)"
+        params: list[Any] = [node.name]
+        if node.db:
+            query += " AND lower(schema_name) = lower(?)"
+            params.append(node.db)
+        row = self.con.execute(query + " LIMIT 1", params).fetchone()
+        if row is None or not row[0]:
+            return None
+        from ..sqlsafety import classify
+
+        try:
+            body = sqlglot.parse_one(str(row[0]), read="duckdb").expression
+        except sqlglot.errors.ParseError:
+            return None
+        if body is None:
+            return None
+        return list(classify(body.sql(dialect="duckdb"), "duckdb").tables)
+
     def _file_info(self, node: exp.Table, ref: str) -> TableInfo | None:
         func = node.this
         args = [a for a in func.iter_expressions() if isinstance(a, exp.Literal) and a.is_string]
         if not args:
             return TableInfo(name=ref, kind="file", notes=["could not read the file path"])
         path = args[0].this
+        from ..security import check_path, policy_for
+
+        refused = check_path(path, policy_for(self.connection))
+        if refused is not None:  # do not even reveal whether the file exists
+            return TableInfo(name=ref, kind="file", notes=[f"{refused.label}: {refused.reason}"])
         files = sorted(glob.glob(path)) if any(ch in path for ch in "*?[") else [path]
         files = [f for f in files if os.path.exists(f)]
         size = sum(os.path.getsize(f) for f in files) if files else None
@@ -148,6 +189,54 @@ class DuckDBEngine(Engine):
         if not files:
             info.notes.append("no files matched the path")
         return info
+
+    def data_version(self, tables: list[str]) -> str | None:
+        """File stamps (mtime + size) of the database file, its WAL and any files read directly.
+        None for in-memory databases, views, attached databases and remote files: no reliable signal."""
+        if self.path == ":memory:" or not tables:
+            return None
+        stamps: list[str] = []
+        uses_db = False
+        main_db = (self.con.execute("SELECT current_database()").fetchone() or [""])[0]
+        for ref in tables:
+            try:
+                node = sqlglot.parse_one(f"SELECT * FROM {ref}", read="duckdb").find(exp.Table)
+            except sqlglot.errors.ParseError:
+                return None
+            if node is None:
+                return None
+            if not isinstance(node.this, exp.Identifier):
+                literals = [a for a in node.this.iter_expressions() if isinstance(a, exp.Literal) and a.is_string]
+                if len(literals) != 1:
+                    return None
+                file_stamps = _file_stamps(literals[0].this)
+                if file_stamps is None:
+                    return None
+                stamps += file_stamps
+                continue
+            if node.catalog and node.catalog.lower() != str(main_db).lower():
+                return None
+            view = self.con.execute("SELECT 1 FROM duckdb_views() WHERE NOT internal AND lower(view_name) = lower(?)",
+                                    [node.name]).fetchone()
+            if view:
+                return None
+            query = ("SELECT 1 FROM duckdb_tables() WHERE lower(database_name) = lower(?) "
+                     "AND lower(table_name) = lower(?)")
+            params: list[Any] = [str(main_db), node.name]
+            if node.db:
+                query += " AND lower(schema_name) = lower(?)"
+                params.append(node.db)
+            if self.con.execute(query, params).fetchone() is None:
+                # not a table of this database file: a replacement scan (FROM 'x.parquet') reads the file itself
+                file_stamps = _file_stamps(node.name) if not node.db else None
+                if file_stamps is None:
+                    return None
+                stamps += file_stamps
+                continue
+            uses_db = True
+        if uses_db:
+            stamps += [_stamp(self.path), _stamp(self.path + ".wal")]
+        return "duckdb:" + "|".join(stamps)
 
     # -- estimation ----------------------------------------------------------------
     def _plan(self, sql: str) -> list[dict[str, Any]]:
@@ -247,6 +336,22 @@ class DuckDBEngine(Engine):
 
         method = "bernoulli" if method == "bernoulli" else "system"
         return f"TABLESAMPLE {percent_text(fraction)}% ({method}, {int(seed)})"
+
+
+def _file_stamps(path: str) -> list[str] | None:
+    """Stamps of the local file(s) a path or glob names; None when any is missing or not a plain local file."""
+    files = sorted(glob.glob(path)) if any(ch in path for ch in "*?[") else [path]
+    if not files or not all(os.path.isfile(f) for f in files):
+        return None
+    return [_stamp(f) for f in files]
+
+
+def _stamp(path: str) -> str:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return f"{path}:none"
+    return f"{path}:{st.st_mtime_ns}:{st.st_size}"
 
 
 def _walk(nodes: list[dict[str, Any]]):

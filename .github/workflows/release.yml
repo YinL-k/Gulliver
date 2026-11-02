@@ -1,9 +1,11 @@
-# Publishes to PyPI when a GitHub release is published.
+# Publishes to PyPI when a version tag (v0.3.0) is pushed or a GitHub release is published.
 # One-time setup on pypi.org: add a "trusted publisher" for project gulliver-mcp,
 # owner laaielichter, repository gulliver, workflow release.yml, environment pypi.
 name: release
 
 on:
+  push:
+    tags: ["v*"]
   release:
     types: [published]
 
@@ -49,3 +51,5 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true  # a tag push and a later release for the same tag must not fail
